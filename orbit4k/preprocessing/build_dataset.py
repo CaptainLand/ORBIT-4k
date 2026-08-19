@@ -6,12 +6,15 @@ import json
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import yaml
 
 from .audio_features import AUDIO_FEATURE_VERSION, AudioFeatureConfig, extract_audio_cache
 from .osu_parser import scan_4k_beatmaps, stable_audio_id
+
+ProgressCallback = Callable[[dict], None]
 
 
 def _load_config(path: str | Path) -> dict:
@@ -49,12 +52,24 @@ def _materialize_input(source: Path, temp: Path) -> Path:
     raise ValueError("input must be a Songs directory, beatmap-set directory, or .zip")
 
 
-def build_dataset(source: str | Path, output: str | Path, config_path: str | Path) -> dict:
+def build_dataset(
+    source: str | Path,
+    output: str | Path,
+    config_path: str | Path,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> dict:
     source = Path(source)
     output = Path(output)
     config = _load_config(config_path)
     grid = config["grid"]
     audio_cfg = AudioFeatureConfig(**config["audio"])
+
+    def emit(**payload) -> None:
+        if progress_callback is not None:
+            progress_callback(payload)
+
+    emit(stage="starting", source=str(source), output=str(output))
     output.mkdir(parents=True, exist_ok=True)
     audio_dir = output / "audio"
     chart_dir = output / "charts"
@@ -63,6 +78,7 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
 
     with tempfile.TemporaryDirectory(prefix="orbit4k_") as tmp:
         scan_root = _materialize_input(source, Path(tmp))
+        emit(stage="scanning", root=str(scan_root))
         accepted, rejected = scan_4k_beatmaps(
             scan_root,
             ticks_per_quarter=int(grid["ticks_per_quarter"]),
@@ -70,11 +86,20 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
             max_quantization_error_ms=float(grid["max_quantization_error_ms"]),
             calculate_stars=True,
         )
+        emit(
+            stage="scan_complete",
+            accepted=len(accepted),
+            rejected=len(rejected),
+            total=len(accepted),
+        )
 
         audio_cache: dict[str, dict] = {}
         audio_ids_by_path: dict[Path, str] = {}
         index_rows: list[dict] = []
-        for beatmap in accepted:
+        total = len(accepted)
+        report_every = max(1, total // 200) if total else 1
+
+        for current, beatmap in enumerate(accepted, 1):
             resolved_audio = beatmap.audio_path.resolve()
             audio_id = audio_ids_by_path.get(resolved_audio)
             if audio_id is None:
@@ -129,6 +154,17 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
             }
             index_rows.append(row)
 
+            if current == 1 or current == total or current % report_every == 0:
+                emit(
+                    stage="processing",
+                    current=current,
+                    total=total,
+                    percent=round(current / max(total, 1) * 100.0, 2),
+                    unique_audio=len(audio_cache),
+                    title=beatmap.title,
+                    version=beatmap.version,
+                )
+
     index_path = output / "index.jsonl"
     index_path.write_text(
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in index_rows),
@@ -154,6 +190,7 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    emit(stage="complete", summary=summary)
     return summary
 
 
@@ -166,8 +203,28 @@ def main() -> None:
     )
     parser.add_argument("--output", type=Path, default=Path("data/processed/v0"))
     parser.add_argument("--config", type=Path, default=Path("configs/v0.yaml"))
+    parser.add_argument(
+        "--progress",
+        action="store_true",
+        help="emit machine-readable progress lines for the local Lab UI",
+    )
     args = parser.parse_args()
-    print(json.dumps(build_dataset(args.input, args.output, args.config), indent=2))
+
+    callback = None
+    if args.progress:
+        def callback(payload: dict) -> None:
+            print(
+                "ORBIT4K_PROGRESS " + json.dumps(payload, ensure_ascii=False),
+                flush=True,
+            )
+
+    summary = build_dataset(
+        args.input,
+        args.output,
+        args.config,
+        progress_callback=callback,
+    )
+    print(json.dumps(summary, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":
