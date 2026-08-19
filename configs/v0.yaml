@@ -9,9 +9,9 @@ grid:
 
 audio:
   sample_rate: 44100
-  n_fft: 2048
-  win_length: 2048
-  hop_length: 441
+  n_fft: 1024
+  win_length: 1024
+  hop_length: 220
   n_mels: 128
   f_min: 30.0
   f_max: 18000.0
@@ -22,12 +22,15 @@ window:
   train_samples_per_chart: 4
 
 model:
+  audio_token_dim: 520
   d_model: 384
   n_heads: 6
   audio_layers: 6
   chart_layers: 8
   dim_feedforward: 1536
   dropout: 0.10
+  local_audio_scale_ticks: 96.0
+  max_cross_attention_bias: 4.0
   state_vocab: 5
   output_states: 4
 
