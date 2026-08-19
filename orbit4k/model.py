@@ -62,7 +62,11 @@ class Orbit4KV0(nn.Module):
             raise ValueError(
                 f"V0 expects {SPECTRAL_VIEW_DIM} spectral + {ENERGY_FEATURE_DIM} energy features"
             )
+        if d_model % 4 != 0:
+            raise ValueError("d_model must be divisible by 4 so every 4K lane keeps its own embedding slice")
+
         self.d_model = d_model
+        self.lane_dim = d_model // 4
         self.local_audio_scale_ticks = float(local_audio_scale_ticks)
         self.max_cross_attention_bias = float(max_cross_attention_bias)
 
@@ -89,9 +93,19 @@ class Orbit4KV0(nn.Module):
             norm=nn.LayerNorm(d_model),
         )
 
-        self.state_embedding = nn.Embedding(5, d_model)
-        self.lane_embedding = nn.Embedding(4, d_model)
-        self.active_ln_embedding = nn.Embedding(2, d_model)
+        # Preserve lane identity explicitly. Each lane owns a fixed slice of the
+        # chart token, so [TAP, EMPTY, EMPTY, EMPTY] and
+        # [EMPTY, EMPTY, EMPTY, TAP] can never collapse merely because they
+        # contain the same multiset of states.
+        self.state_embedding = nn.Embedding(5, self.lane_dim)
+        self.lane_embedding = nn.Embedding(4, self.lane_dim)
+        self.active_ln_embedding = nn.Embedding(2, self.lane_dim)
+        self.chart_projection = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+        )
+
         self.beat_phase = nn.Embedding(24, d_model)
         self.measure_phase = nn.Embedding(96, d_model)
         self.condition = ContinuousCondition(d_model)
@@ -130,14 +144,21 @@ class Orbit4KV0(nn.Module):
         bpm: torch.Tensor,
         stars: torch.Tensor,
     ) -> torch.Tensor:
+        if chart_input.shape[-1] != 4 or active_ln.shape[-1] != 4:
+            raise ValueError("ORBIT-4K V0 expects exactly four chart lanes")
+
         lane_ids = torch.arange(4, device=chart_input.device)
-        states = self.state_embedding(chart_input)
-        lane_bias = self.lane_embedding(lane_ids).view(1, 1, 4, self.d_model)
-        chart = (states + lane_bias).mean(dim=2)
-        active = (self.active_ln_embedding(active_ln) + lane_bias).mean(dim=2)
+        lane_bias = self.lane_embedding(lane_ids).view(1, 1, 4, self.lane_dim)
+        lane_features = (
+            self.state_embedding(chart_input)
+            + self.active_ln_embedding(active_ln)
+            + lane_bias
+        )
+        # [B, T, 4, lane_dim] -> [B, T, 4 * lane_dim]. Concatenation,
+        # rather than averaging, keeps every lane in a distinct feature slice.
+        chart = self.chart_projection(lane_features.flatten(start_dim=2))
         chart = (
             chart
-            + active
             + self.beat_phase(tick % 24)
             + self.measure_phase(tick % 96)
             + sinusoidal_tick_encoding(tick, self.d_model).to(chart.dtype)
