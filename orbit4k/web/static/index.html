@@ -42,7 +42,7 @@
     </section>
 
     <section class="panel" id="builder">
-      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤 V0 不支持的多 BPM / 非 4/4 / 量化误差异常谱面。大目录建议放到独立磁盘。</p></div></header>
+      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤 V0 不支持的多 BPM / 非 4/4 / 量化误差异常谱面。长音频采用分块频谱分析；单个坏音频会被拒绝并继续下一首，不再中断整批任务。</p></div></header>
       <div class="form-grid">
         <label><span>原始谱面 / Songs 路径</span><input id="sourcePath" placeholder="D:\osu!\Songs" /></label>
         <label><span>清洗输出路径</span><input id="outputPath" value="data/processed/v0" /></label>
@@ -60,19 +60,23 @@
         <div><span>Unique Audio</span><b id="prepareAudio">—</b></div>
         <div><span>Accepted / Rejected</span><b id="prepareAccepted">—</b></div>
       </div>
+      <div id="prepareFailure" class="failure-box hidden"></div>
       <div id="datasetSummary" class="summary-box hidden"></div>
       <pre class="console" id="prepareLog">等待开始清洗…</pre>
     </section>
 
     <section class="panel" id="training">
-      <header><div><p class="eyebrow">TRAINING CONTROL</p><h2>指定 Dataset，启动 / 停止训练</h2><p>训练仍使用 <code>configs/v0.yaml</code> 中的 batch、epochs、LR 等参数；Web 负责进程控制、日志与指标展示。</p></div></header>
+      <header><div><p class="eyebrow">TRAINING CONTROL</p><h2>指定 Dataset，启动 / 停止训练</h2><p>只有 Dataset Builder 正常完成、最终索引与 summary 均存在时才允许训练。partial 缓存会保留，但不会被误当成正式训练集。</p></div></header>
       <div class="form-grid">
         <label><span>清洗后的 Dataset</span><input id="trainDataPath" value="data/processed/v0" /></label>
         <label><span>Checkpoint / Run 输出</span><input id="runDir" value="runs/v0" /></label>
         <label><span>配置文件</span><input id="trainConfig" value="configs/v0.yaml" /></label>
       </div>
+      <div id="datasetReadiness" class="summary-box warning">
+        <b>正在检查 Dataset 状态…</b>
+      </div>
       <div class="toolbar">
-        <button class="primary-btn" id="trainStart">开始训练</button>
+        <button class="primary-btn" id="trainStart" disabled>开始训练</button>
         <button class="danger-btn" id="trainStop">停止训练</button>
         <span class="status-pill" id="trainState">idle</span>
       </div>
@@ -89,7 +93,7 @@
         </div>
       </div>
       <pre class="console" id="trainLog">等待开始训练…</pre>
-      <p class="note">训练进程被停止时，已经写出的 <code>last.pt</code> / <code>best.pt</code> 与 metrics.jsonl 会保留；是否存在可恢复训练逻辑取决于训练脚本版本，V0 当前默认重新启动一轮。</p>
+      <p class="note">训练进程被停止时，已经写出的 <code>last.pt</code> / <code>best.pt</code> 与 metrics.jsonl 会保留；V0 当前默认重新启动一轮。</p>
     </section>
 
     <section class="panel" id="dataset">
