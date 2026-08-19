@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-from .audio_features import AudioFeatureConfig, extract_log_mel
+from .audio_features import AUDIO_FEATURE_VERSION, AudioFeatureConfig, extract_audio_cache
 from .osu_parser import scan_4k_beatmaps, stable_audio_id
 
 
@@ -80,21 +80,29 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
             if audio_id is None:
                 audio_id = stable_audio_id(beatmap.audio_path)
                 audio_ids_by_path[resolved_audio] = audio_id
+
             if audio_id not in audio_cache:
-                mel_path = audio_dir / f"{audio_id}.npz"
-                if not mel_path.exists():
-                    mel, duration_ms = extract_log_mel(beatmap.audio_path, audio_cfg)
-                    np.savez_compressed(
-                        mel_path,
-                        mel=mel,
-                        duration_ms=np.float32(duration_ms),
-                        sample_rate=np.int32(audio_cfg.sample_rate),
-                        hop_length=np.int32(audio_cfg.hop_length),
-                    )
+                feature_path = audio_dir / f"{audio_id}.npz"
+                rebuild_audio = not feature_path.exists()
+                if feature_path.exists():
+                    with np.load(feature_path) as data:
+                        existing_version = int(data.get("feature_version", 1))
+                    rebuild_audio = existing_version != AUDIO_FEATURE_VERSION
+
+                if rebuild_audio:
+                    cache = extract_audio_cache(beatmap.audio_path, audio_cfg)
+                    np.savez_compressed(feature_path, **cache)
+                    duration_ms = float(cache["duration_ms"])
+                    feature_version = int(cache["feature_version"])
                 else:
-                    with np.load(mel_path) as data:
+                    with np.load(feature_path) as data:
                         duration_ms = float(data["duration_ms"])
-                audio_cache[audio_id] = {"path": str(mel_path.relative_to(output)), "duration_ms": duration_ms}
+                        feature_version = int(data["feature_version"])
+                audio_cache[audio_id] = {
+                    "path": str(feature_path.relative_to(output)),
+                    "duration_ms": duration_ms,
+                    "feature_version": feature_version,
+                }
 
             chart_id = hashlib.sha1(beatmap.path.read_bytes()).hexdigest()[:16]
             chart_path = chart_dir / f"{chart_id}.npz"
@@ -104,6 +112,7 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
                 "chart_id": chart_id,
                 "audio_id": audio_id,
                 "audio_path": audio_cache[audio_id]["path"],
+                "audio_feature_version": audio_cache[audio_id]["feature_version"],
                 "chart_path": str(chart_path.relative_to(output)),
                 "split": split,
                 "title": beatmap.title,
@@ -121,22 +130,40 @@ def build_dataset(source: str | Path, output: str | Path, config_path: str | Pat
             index_rows.append(row)
 
     index_path = output / "index.jsonl"
-    index_path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in index_rows), encoding="utf-8")
-    (output / "rejected.json").write_text(json.dumps(rejected, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in index_rows),
+        encoding="utf-8",
+    )
+    (output / "rejected.json").write_text(
+        json.dumps(rejected, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    feature_versions = sorted({int(row["audio_feature_version"]) for row in index_rows})
     summary = {
         "accepted_charts": len(index_rows),
         "rejected_charts": len(rejected),
         "unique_audio": len({row["audio_id"] for row in index_rows}),
+        "audio_feature_versions": feature_versions,
         "missing_star_ratings": sum(row["star_rating"] is None for row in index_rows),
-        "splits": {name: sum(row["split"] == name for row in index_rows) for name in ("train", "validation", "test")},
+        "splits": {
+            name: sum(row["split"] == name for row in index_rows)
+            for name in ("train", "validation", "test")
+        },
     }
-    (output / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (output / "summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return summary
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build ORBIT-4K V0 training data")
-    parser.add_argument("input", type=Path, help="osu! Songs directory, beatmap-set directory, or .zip")
+    parser.add_argument(
+        "input",
+        type=Path,
+        help="osu! Songs directory, beatmap-set directory, or .zip",
+    )
     parser.add_argument("--output", type=Path, default=Path("data/processed/v0"))
     parser.add_argument("--config", type=Path, default=Path("configs/v0.yaml"))
     args = parser.parse_args()
