@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ORBIT-4K · V0 Lab</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="glow glow-a"></div><div class="glow glow-b"></div>
+  <main>
+    <nav><div class="brand"><span class="orb"></span>ORBIT-4K</div><div class="badge">V0 · Audio-conditioned</div></nav>
+    <section class="hero">
+      <div>
+        <p class="eyebrow">END-TO-END 4K CHART TRANSFORMER</p>
+        <h1>让模型直接听音乐，<br><span>直接写出最终四轨谱面。</span></h1>
+        <p class="lede">V0 固定 BPM / Offset，以 1/96 全音符网格对齐音频与谱面。Audio Encoder 与 Chart Decoder 联合训练，不经过独立采音器。</p>
+        <div class="actions"><a class="primary" href="#dataset">检查谱面包</a><a class="ghost" href="#train">训练流程</a></div>
+      </div>
+      <div class="visual-card">
+        <div class="grid-demo" id="gridDemo"></div>
+        <div class="signal"></div>
+        <div class="visual-label"><b>AUDIO MEMORY</b><span>Cross Attention → 4 × 4 states</span></div>
+      </div>
+    </section>
+
+    <section class="stats" id="stats">
+      <article><span>Model</span><b id="modelName">Loading…</b></article>
+      <article><span>Parameters</span><b id="params">—</b></article>
+      <article><span>Grid</span><b id="grid">—</b></article>
+      <article><span>Checkpoint</span><b id="checkpoint">—</b></article>
+    </section>
+
+    <section class="panel architecture">
+      <header><div><p class="eyebrow">ARCHITECTURE</p><h2>一个端到端目标，两类注意力</h2></div></header>
+      <div class="flow">
+        <div class="node accent"><small>INPUT</small><b>Log-Mel Audio</b><span>128 bins</span></div><i>→</i>
+        <div class="node"><small>BIDIRECTIONAL</small><b>Audio Encoder</b><span>6 × Transformer</span></div><i>⇢</i>
+        <div class="node"><small>CAUSAL + CROSS</small><b>Chart Decoder</b><span>8 × Transformer</span></div><i>→</i>
+        <div class="node accent"><small>OUTPUT</small><b>[T, 4, 4]</b><span>Empty / Tap / LN start / end</span></div>
+      </div>
+      <div class="chips"><span>BPM</span><span>Offset</span><span>Beat phase</span><span>Measure phase</span><span>Star rating</span><span>Previous chart</span></div>
+    </section>
+
+    <section class="panel" id="dataset">
+      <header><div><p class="eyebrow">DATASET GATE</p><h2>先过滤，再向量化</h2><p>只接受 <code>Mode: 3</code> + <code>CircleSize: 4</code>。V0 还会拒绝多红线变 BPM、非 4/4、量化误差过大的谱。</p></div></header>
+      <label class="drop" id="dropZone">
+        <input id="zipInput" type="file" accept=".zip" />
+        <span class="drop-icon">↥</span><b>拖入一个 osu! beatmap-set ZIP</b><small>这里只做检查，不会加入仓库或训练集</small>
+      </label>
+      <div id="inspectResult" class="result hidden"></div>
+    </section>
+
+    <section class="panel" id="train">
+      <header><div><p class="eyebrow">LOCAL TRAINING</p><h2>Pull 下来即可开始准备数据</h2></div></header>
+      <div class="steps">
+        <div><em>01</em><b>安装</b><code>pip install -e .</code></div>
+        <div><em>02</em><b>清洗 Songs</b><code>python scripts/prepare_dataset.py "D:\\osu!\\Songs"</code></div>
+        <div><em>03</em><b>检查 summary</b><code>data/processed/v0/summary.json</code></div>
+        <div><em>04</em><b>训练 V0</b><code>python scripts/train_v0.py</code></div>
+      </div>
+      <p class="note">数据 split 按音频 SHA-1 分组，同一首歌的所有难度必定进入同一个 train / validation / test split，避免音频泄漏。</p>
+    </section>
+    <footer>ORBIT-4K · Research baseline · CaptainLand</footer>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+.pytest_cache/
+.ruff_cache/
+
+# training data / checkpoints
+data/raw/
+data/processed/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# temporary uploads
+.tmp/

@@ -1,0 +1,52 @@
+seed: 20260820
+
+grid:
+  ticks_per_quarter: 24
+  ticks_per_measure: 96
+  supported_meter: 4
+  max_quantization_error_ms: 8.0
+  constant_bpm_only: true
+
+audio:
+  sample_rate: 44100
+  n_fft: 2048
+  win_length: 2048
+  hop_length: 441
+  n_mels: 128
+  f_min: 30.0
+  f_max: 18000.0
+
+window:
+  measures: 16
+  stride_measures: 8
+  train_samples_per_chart: 4
+
+model:
+  d_model: 384
+  n_heads: 6
+  audio_layers: 6
+  chart_layers: 8
+  dim_feedforward: 1536
+  dropout: 0.10
+  state_vocab: 5
+  output_states: 4
+
+training:
+  batch_size: 2
+  gradient_accumulation: 8
+  epochs: 30
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 1000
+  num_workers: 2
+  amp: true
+  clip_grad_norm: 1.0
+  class_weights: [0.15, 1.0, 1.4, 1.4]
+  onset_weight: 0.35
+  density_weight: 0.10
+  validation_every: 1
+
+splits:
+  train: 0.90
+  validation: 0.05
+  test: 0.05
