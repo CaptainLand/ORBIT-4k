@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 import torchaudio
 
 
@@ -23,6 +24,7 @@ class AudioFeatureConfig:
     n_mels: int = 128
     f_min: float = 30.0
     f_max: float = 18000.0
+    chunk_seconds: float = 30.0
 
 
 def load_mono(path: str | Path, target_sample_rate: int) -> torch.Tensor:
@@ -36,16 +38,8 @@ def load_mono(path: str | Path, target_sample_rate: int) -> torch.Tensor:
     return waveform.float()
 
 
-def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[str, np.ndarray | float | int]:
-    """
-    Build a song-level cache.
-
-    We intentionally preserve raw log-Mel values and store song statistics separately.
-    This lets the beat-synchronous tokenizer expose both absolute/mastering information
-    and song-relative normalized structure to the model.
-    """
-    waveform = load_mono(path, config.sample_rate)
-    transform = torchaudio.transforms.MelSpectrogram(
+def _mel_transform(config: AudioFeatureConfig, *, center: bool) -> torchaudio.transforms.MelSpectrogram:
+    return torchaudio.transforms.MelSpectrogram(
         sample_rate=config.sample_rate,
         n_fft=config.n_fft,
         win_length=config.win_length,
@@ -54,41 +48,119 @@ def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[st
         f_max=min(config.f_max, config.sample_rate / 2),
         n_mels=config.n_mels,
         power=2.0,
-        center=True,
+        center=center,
     )
+
+
+def chunked_mel_power(
+    waveform: torch.Tensor,
+    config: AudioFeatureConfig,
+) -> np.ndarray:
+    """Compute the same center-aligned Mel grid in bounded STFT chunks.
+
+    A whole-song ``MelSpectrogram`` materializes a very large STFT tensor for
+    marathon audio. We reproduce ``center=True`` frame alignment by reflect
+    padding once, slicing only the samples needed by a bounded range of output
+    frames, and running ``center=False`` on each slice.
+
+    The returned array is [frames, n_mels] float32. Peak STFT memory is bounded
+    by ``chunk_seconds`` instead of song duration.
+    """
+    if waveform.ndim != 2 or waveform.shape[0] != 1:
+        raise ValueError(f"expected mono waveform [1, samples], got {tuple(waveform.shape)}")
+    if config.win_length > config.n_fft:
+        raise ValueError("win_length must not exceed n_fft")
+
+    signal = waveform[0]
+    sample_count = int(signal.numel())
+    if sample_count == 0:
+        return np.zeros((0, config.n_mels), dtype=np.float32)
+
+    pad = config.n_fft // 2
+    # torch.stft(center=True) uses reflect padding by default. Very short clips
+    # cannot be reflected by n_fft//2, so use constant padding as a safe fallback.
+    if sample_count > pad:
+        padded = F.pad(signal[None, None, :], (pad, pad), mode="reflect")[0, 0]
+    else:
+        padded = F.pad(signal, (pad, pad))
+
+    total_frames = 1 + sample_count // config.hop_length
+    frames_per_chunk = max(
+        1,
+        int(float(config.chunk_seconds) * config.sample_rate / config.hop_length),
+    )
+    transform = _mel_transform(config, center=False)
+    result = np.empty((total_frames, config.n_mels), dtype=np.float32)
+
     with torch.no_grad():
-        mel_power = transform(waveform).squeeze(0).clamp_min(1e-8)
-        log_mel = torch.log(mel_power)
-        mel_mean = log_mel.mean(dim=1)
-        mel_std = log_mel.std(dim=1).clamp_min(1e-4)
+        for frame_start in range(0, total_frames, frames_per_chunk):
+            frame_end = min(total_frames, frame_start + frames_per_chunk)
+            sample_start = frame_start * config.hop_length
+            sample_end = (frame_end - 1) * config.hop_length + config.n_fft
+            segment = padded[sample_start:sample_end].unsqueeze(0)
+            mel = transform(segment).squeeze(0).transpose(0, 1)
+            expected = frame_end - frame_start
+            if mel.shape[0] != expected:
+                raise RuntimeError(
+                    f"chunked Mel frame mismatch: {mel.shape[0]} != {expected}"
+                )
+            result[frame_start:frame_end] = mel.cpu().numpy().astype(np.float32, copy=False)
 
-        one_third = config.n_mels // 3
-        two_thirds = (config.n_mels * 2) // 3
+    return result
 
-        def log_band(start: int, end: int) -> torch.Tensor:
-            return torch.log(mel_power[start:end].mean(dim=0).clamp_min(1e-8))
 
-        log_energy = torch.stack(
-            [
-                torch.log(mel_power.mean(dim=0).clamp_min(1e-8)),
-                log_band(0, one_third),
-                log_band(one_third, two_thirds),
-                log_band(two_thirds, config.n_mels),
-            ],
-            dim=1,
-        )
-        total_energy = log_energy[:, 0]
-        energy_median = total_energy.median()
-        energy_mad = (total_energy - energy_median).abs().median().clamp_min(1e-3) * 1.4826
+def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[str, np.ndarray | float | int]:
+    """
+    Build a song-level cache.
+
+    Raw log-Mel values and song statistics are stored separately so the
+    beat-synchronous tokenizer can expose both absolute/mastering information
+    and song-relative structure. STFT work is chunked to keep RAM bounded for
+    long songs.
+    """
+    waveform = load_mono(path, config.sample_rate)
+    mel_power_np = chunked_mel_power(waveform, config)
+    if len(mel_power_np) == 0:
+        raise ValueError("decoded audio contains no analysis frames")
+
+    mel_power = np.maximum(mel_power_np, 1e-8)
+    log_mel = np.log(mel_power).astype(np.float32)
+
+    # Statistics are computed in float64 accumulation for long songs, while the
+    # stored frame cache stays float16 to control disk usage.
+    mel_mean = log_mel.mean(axis=0, dtype=np.float64).astype(np.float32)
+    mel_std = log_mel.std(axis=0, dtype=np.float64).astype(np.float32)
+    mel_std = np.maximum(mel_std, 1e-4)
+
+    one_third = config.n_mels // 3
+    two_thirds = (config.n_mels * 2) // 3
+
+    def log_band(start: int, end: int) -> np.ndarray:
+        return np.log(np.maximum(mel_power[:, start:end].mean(axis=1), 1e-8)).astype(np.float32)
+
+    log_energy = np.stack(
+        [
+            np.log(np.maximum(mel_power.mean(axis=1), 1e-8)).astype(np.float32),
+            log_band(0, one_third),
+            log_band(one_third, two_thirds),
+            log_band(two_thirds, config.n_mels),
+        ],
+        axis=1,
+    )
+    total_energy = log_energy[:, 0]
+    energy_median = float(np.median(total_energy))
+    energy_mad = float(
+        max(np.median(np.abs(total_energy - energy_median)) * 1.4826, 1e-3)
+    )
 
     duration_ms = waveform.shape[-1] / config.sample_rate * 1000.0
     return {
-        "log_mel": log_mel.transpose(0, 1).cpu().numpy().astype(np.float16),
-        "mel_mean": mel_mean.cpu().numpy().astype(np.float32),
-        "mel_std": mel_std.cpu().numpy().astype(np.float32),
-        "log_energy": log_energy.cpu().numpy().astype(np.float16),
-        "energy_median": float(energy_median),
-        "energy_mad": float(energy_mad),
+        "log_mel": log_mel.astype(np.float16),
+        "mel_mean": mel_mean,
+        "mel_std": mel_std,
+        "log_energy": log_energy.astype(np.float16),
+        "energy_median": energy_median,
+        "energy_mad": energy_mad,
         "duration_ms": float(duration_ms),
         "sample_rate": int(config.sample_rate),
         "hop_length": int(config.hop_length),
