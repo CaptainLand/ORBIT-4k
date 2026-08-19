@@ -5,7 +5,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 import torchaudio
 
 
@@ -60,8 +59,8 @@ def chunked_mel_power(
 
     A whole-song ``MelSpectrogram`` materializes a very large STFT tensor for
     marathon audio. We reproduce ``center=True`` frame alignment by reflect
-    padding once, slicing only the samples needed by a bounded range of output
-    frames, and running ``center=False`` on each slice.
+    mapping each bounded chunk through the same global reflect-padding indices
+    and running ``center=False`` on that chunk.
 
     The returned array is [frames, n_mels] float32. Peak STFT memory is bounded
     by ``chunk_seconds`` instead of song duration.
@@ -77,13 +76,6 @@ def chunked_mel_power(
         return np.zeros((0, config.n_mels), dtype=np.float32)
 
     pad = config.n_fft // 2
-    # torch.stft(center=True) uses reflect padding by default. Very short clips
-    # cannot be reflected by n_fft//2, so use constant padding as a safe fallback.
-    if sample_count > pad:
-        padded = F.pad(signal[None, None, :], (pad, pad), mode="reflect")[0, 0]
-    else:
-        padded = F.pad(signal, (pad, pad))
-
     total_frames = 1 + sample_count // config.hop_length
     frames_per_chunk = max(
         1,
@@ -92,12 +84,26 @@ def chunked_mel_power(
     transform = _mel_transform(config, center=False)
     result = np.empty((total_frames, config.n_mels), dtype=np.float32)
 
+    def reflected_segment(start: int, end: int) -> torch.Tensor:
+        # Reproduce global reflect padding without allocating a second whole-song
+        # waveform. Only the current analysis chunk is materialized.
+        if sample_count == 1:
+            return signal.new_full((end - start,), signal[0])
+        positions = torch.arange(start, end, device=signal.device)
+        period = 2 * (sample_count - 1)
+        mapped = torch.remainder(positions, period)
+        mapped = torch.where(mapped < sample_count, mapped, period - mapped)
+        return signal[mapped.long()]
+
     with torch.no_grad():
         for frame_start in range(0, total_frames, frames_per_chunk):
             frame_end = min(total_frames, frame_start + frames_per_chunk)
-            sample_start = frame_start * config.hop_length
-            sample_end = (frame_end - 1) * config.hop_length + config.n_fft
-            segment = padded[sample_start:sample_end].unsqueeze(0)
+            padded_start = frame_start * config.hop_length
+            padded_end = (frame_end - 1) * config.hop_length + config.n_fft
+            segment = reflected_segment(
+                padded_start - pad,
+                padded_end - pad,
+            ).unsqueeze(0)
             mel = transform(segment).squeeze(0).transpose(0, 1)
             expected = frame_end - frame_start
             if mel.shape[0] != expected:
@@ -123,14 +129,8 @@ def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[st
     if len(mel_power_np) == 0:
         raise ValueError("decoded audio contains no analysis frames")
 
-    mel_power = np.maximum(mel_power_np, 1e-8)
-    log_mel = np.log(mel_power).astype(np.float32)
-
-    # Statistics are computed in float64 accumulation for long songs, while the
-    # stored frame cache stays float16 to control disk usage.
-    mel_mean = log_mel.mean(axis=0, dtype=np.float64).astype(np.float32)
-    mel_std = log_mel.std(axis=0, dtype=np.float64).astype(np.float32)
-    mel_std = np.maximum(mel_std, 1e-4)
+    mel_power = mel_power_np
+    np.maximum(mel_power, 1e-8, out=mel_power)
 
     one_third = config.n_mels // 3
     two_thirds = (config.n_mels * 2) // 3
@@ -138,6 +138,9 @@ def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[st
     def log_band(start: int, end: int) -> np.ndarray:
         return np.log(np.maximum(mel_power[:, start:end].mean(axis=1), 1e-8)).astype(np.float32)
 
+    # Compute energy before converting the full Mel matrix to log space. The
+    # conversion is then performed in-place so long songs do not require both a
+    # full float32 power matrix and a second full float32 log-Mel matrix.
     log_energy = np.stack(
         [
             np.log(np.maximum(mel_power.mean(axis=1), 1e-8)).astype(np.float32),
@@ -147,6 +150,14 @@ def extract_audio_cache(path: str | Path, config: AudioFeatureConfig) -> dict[st
         ],
         axis=1,
     )
+    np.log(mel_power, out=mel_power)
+    log_mel = mel_power
+
+    # Statistics are computed in float64 accumulation for long songs, while the
+    # stored frame cache stays float16 to control disk usage.
+    mel_mean = log_mel.mean(axis=0, dtype=np.float64).astype(np.float32)
+    mel_std = log_mel.std(axis=0, dtype=np.float64).astype(np.float32)
+    mel_std = np.maximum(mel_std, 1e-4)
     total_energy = log_energy[:, 0]
     energy_median = float(np.median(total_energy))
     energy_mad = float(
