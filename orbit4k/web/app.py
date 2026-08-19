@@ -118,7 +118,10 @@ class ManagedJob:
                 self.logs.append(line)
                 if line.startswith("ORBIT4K_PROGRESS "):
                     try:
-                        self.progress = json.loads(line[len("ORBIT4K_PROGRESS "):])
+                        payload = json.loads(line[len("ORBIT4K_PROGRESS "):])
+                        # Preserve scan totals while later processing events update
+                        # current/percent/title fields.
+                        self.progress.update(payload)
                     except json.JSONDecodeError:
                         pass
                 else:
@@ -160,6 +163,14 @@ class ManagedJob:
             now = time.time()
             end = self.ended_at or now
             elapsed = None if self.started_at is None else max(0.0, end - self.started_at)
+            failure_reason = None
+            if self.state == "failed":
+                failure_reason = self.progress.get("last_error")
+                if not failure_reason:
+                    for line in reversed(self.logs):
+                        if line.strip() and not line.startswith("ORBIT4K_PROGRESS "):
+                            failure_reason = line.strip()
+                            break
             return {
                 "name": self.name,
                 "state": self.state,
@@ -168,6 +179,7 @@ class ManagedJob:
                 "ended_at": self.ended_at,
                 "elapsed_seconds": elapsed,
                 "returncode": self.returncode,
+                "failure_reason": failure_reason,
                 "progress": dict(self.progress),
                 "records": list(self.records),
                 "logs": list(self.logs),
@@ -184,14 +196,48 @@ def ensure_idle() -> None:
         raise HTTPException(409, "another ORBIT-4K job is already running")
 
 
-def dataset_summary(path: Path) -> dict | None:
-    summary_path = path / "summary.json"
-    if not summary_path.exists():
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
         return None
     try:
-        return json.loads(summary_path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def dataset_summary(path: Path) -> dict | None:
+    return _read_json(path / "summary.json")
+
+
+def dataset_status(path: Path) -> dict[str, Any]:
+    index_path = path / "index.jsonl"
+    summary = dataset_summary(path)
+    state = _read_json(path / "dataset_state.json")
+    index_exists = index_path.is_file()
+    summary_exists = summary is not None
+
+    # New builders explicitly mark completion. Legacy datasets created before
+    # dataset_state.json existed remain usable if both final artifacts exist.
+    if state is None:
+        complete = index_exists and summary_exists
+        status_name = "complete" if complete else "missing"
+    else:
+        complete = state.get("status") == "complete"
+        status_name = str(state.get("status") or "unknown")
+
+    ready = bool(complete and index_exists and summary_exists)
+    return {
+        "path": str(path),
+        "ready": ready,
+        "status": status_name,
+        "index_exists": index_exists,
+        "summary_exists": summary_exists,
+        "state": state,
+        "summary": summary,
+        "partial_index_exists": (path / "index.partial.jsonl").is_file(),
+        "partial_rejected_exists": (path / "rejected.partial.json").is_file(),
+    }
 
 
 @app.get("/")
@@ -280,8 +326,13 @@ def start_train(request: TrainRequest):
     data = resolve_path(request.data_path)
     run_dir = resolve_path(request.run_dir)
     cfg = resolve_path(request.config_path)
-    if not (data / "index.jsonl").is_file():
-        raise HTTPException(400, f"dataset index not found: {data / 'index.jsonl'}")
+    readiness = dataset_status(data)
+    if not readiness["ready"]:
+        detail = (
+            f"dataset is not ready (state={readiness['status']}). "
+            "Finish Dataset Builder first; partial caches/checkpoints are not a trainable dataset."
+        )
+        raise HTTPException(400, detail)
     if not cfg.is_file():
         raise HTTPException(400, f"config file does not exist: {cfg}")
     command = [
@@ -314,6 +365,12 @@ def get_dataset_summary(path: str):
     if summary is None:
         raise HTTPException(404, f"summary.json not found under {resolved}")
     return {"path": str(resolved), "summary": summary}
+
+
+@app.get("/api/dataset-status")
+def get_dataset_status(path: str):
+    resolved = resolve_path(path)
+    return dataset_status(resolved)
 
 
 @app.post("/api/inspect-zip")
