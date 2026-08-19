@@ -9,7 +9,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from .preprocessing.audio_features import align_mel_to_ticks
+from .preprocessing.audio_features import (
+    AUDIO_FEATURE_VERSION,
+    beat_synchronous_audio_tokens,
+)
 
 BOS = 4
 
@@ -40,7 +43,7 @@ class Orbit4KDataset(Dataset):
         self.stride_ticks = stride_measures * ticks_per_measure
         self.random_crop = random_crop and split == "train"
         self.audio_cache_size = audio_cache_size
-        self.audio_cache: OrderedDict[str, tuple[np.ndarray, int, int]] = OrderedDict()
+        self.audio_cache: OrderedDict[str, dict[str, np.ndarray | float | int]] = OrderedDict()
         self.samples: list[tuple[int, int]] = []
         for row_index, row in enumerate(self.rows):
             total = int(row["total_ticks"])
@@ -57,14 +60,31 @@ class Orbit4KDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
-    def _audio(self, row: dict) -> tuple[np.ndarray, int, int]:
+    def _audio(self, row: dict) -> dict[str, np.ndarray | float | int]:
         key = row["audio_path"]
         if key in self.audio_cache:
             value = self.audio_cache.pop(key)
             self.audio_cache[key] = value
             return value
         with np.load(self.root / key) as data:
-            value = (data["mel"].astype(np.float32), int(data["sample_rate"]), int(data["hop_length"]))
+            version = int(data.get("feature_version", 1))
+            if version != AUDIO_FEATURE_VERSION:
+                raise RuntimeError(
+                    f"audio cache version {version} is incompatible with V0 feature version "
+                    f"{AUDIO_FEATURE_VERSION}; rebuild the dataset with scripts/prepare_dataset.py"
+                )
+            value = {
+                "log_mel": data["log_mel"].astype(np.float32),
+                "mel_mean": data["mel_mean"].astype(np.float32),
+                "mel_std": data["mel_std"].astype(np.float32),
+                "log_energy": data["log_energy"].astype(np.float32),
+                "energy_median": float(data["energy_median"]),
+                "energy_mad": float(data["energy_mad"]),
+                "duration_ms": float(data["duration_ms"]),
+                "sample_rate": int(data["sample_rate"]),
+                "hop_length": int(data["hop_length"]),
+                "feature_version": version,
+            }
         self.audio_cache[key] = value
         while len(self.audio_cache) > self.audio_cache_size:
             self.audio_cache.popitem(last=False)
@@ -92,7 +112,6 @@ class Orbit4KDataset(Dataset):
         mask = np.zeros(self.window_ticks, dtype=np.float32)
         mask[:length] = 1.0
 
-        # Explicit LN occupancy is important when a crop starts in the middle of a hold.
         active = np.zeros(4, dtype=np.uint8)
         for state_row in chart[:start]:
             for lane, state in enumerate(state_row):
@@ -109,16 +128,22 @@ class Orbit4KDataset(Dataset):
                 elif state == 3:
                     active[lane] = 0
 
-        mel, sample_rate, hop_length = self._audio(row)
-        audio = align_mel_to_ticks(
-            mel,
+        cache = self._audio(row)
+        audio = beat_synchronous_audio_tokens(
+            cache["log_mel"],
+            cache["mel_mean"],
+            cache["mel_std"],
+            cache["log_energy"],
+            energy_median=float(cache["energy_median"]),
+            energy_mad=float(cache["energy_mad"]),
+            duration_ms=float(cache["duration_ms"]),
             start_tick=start,
             length=self.window_ticks,
             offset_ms=float(row["offset_ms"]),
             beat_length_ms=float(row["beat_length_ms"]),
             ticks_per_quarter=self.ticks_per_quarter,
-            hop_length=hop_length,
-            sample_rate=sample_rate,
+            hop_length=int(cache["hop_length"]),
+            sample_rate=int(cache["sample_rate"]),
         )
         if length < self.window_ticks:
             audio[length:] = 0.0
