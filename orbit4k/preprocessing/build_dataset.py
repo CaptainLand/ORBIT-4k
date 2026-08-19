@@ -4,6 +4,7 @@ import argparse
 import gc
 import hashlib
 import json
+import sys
 import tempfile
 import zipfile
 from pathlib import Path
@@ -100,6 +101,32 @@ def _reject_row(beatmap, reason: str, error: str | None = None) -> dict:
     if error:
         row["error"] = error[:1200]
     return row
+
+
+def _progress_line(payload: dict) -> str:
+    """Return an ASCII-only progress record safe for GBK/cp936 consoles.
+
+    Dataset files themselves remain UTF-8 with real Unicode. Only the
+    subprocess transport line uses JSON escapes so unusual mapper/song titles
+    can never crash the builder while being printed to a Windows pipe.
+    """
+    return "ORBIT4K_PROGRESS " + json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _configure_process_text_streams() -> None:
+    """Prefer UTF-8 for CLI/subprocess logs without trusting the Windows locale."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (OSError, ValueError):
+            pass
 
 
 def build_dataset(
@@ -364,6 +391,8 @@ def build_dataset(
 
 
 def main() -> None:
+    _configure_process_text_streams()
+
     parser = argparse.ArgumentParser(description="Build ORBIT-4K V0 training data")
     parser.add_argument(
         "input",
@@ -382,10 +411,7 @@ def main() -> None:
     callback = None
     if args.progress:
         def callback(payload: dict) -> None:
-            print(
-                "ORBIT4K_PROGRESS " + json.dumps(payload, ensure_ascii=False),
-                flush=True,
-            )
+            print(_progress_line(payload), flush=True)
 
     summary = build_dataset(
         args.input,
@@ -393,7 +419,9 @@ def main() -> None:
         args.config,
         progress_callback=callback,
     )
-    print(json.dumps(summary, ensure_ascii=False), flush=True)
+    # The final CLI summary is also ASCII-safe so a non-UTF-8 console can never
+    # fail after all expensive preprocessing work has already completed.
+    print(json.dumps(summary, ensure_ascii=True), flush=True)
 
 
 if __name__ == "__main__":
