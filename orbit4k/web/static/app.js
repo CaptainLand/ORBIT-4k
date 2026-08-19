@@ -2,11 +2,14 @@ const $ = q => document.querySelector(q);
 const formatParams = n => n ? `${(n/1e6).toFixed(2)}M` : '—';
 const fmt = (n, d=4) => Number.isFinite(Number(n)) ? Number(n).toFixed(d) : '—';
 const savedKeys = ['sourcePath','outputPath','prepareConfig','trainDataPath','runDir','trainConfig'];
+let datasetReady = false;
+let trainRunning = false;
 
 function savePaths(){ savedKeys.forEach(k => localStorage.setItem(`orbit4k:${k}`, $(`#${k}`).value)); }
 function restorePaths(){ savedKeys.forEach(k => { const v=localStorage.getItem(`orbit4k:${k}`); if(v) $(`#${k}`).value=v; }); }
 function setText(id, value){ $(id).textContent = value ?? '—'; }
 function logsText(lines){ return (lines && lines.length ? lines.slice(-80).join('\n') : '—'); }
+function updateTrainButton(){ $('#trainStart').disabled = trainRunning || !datasetReady; }
 
 async function api(url, options={}){
   const r = await fetch(url, options);
@@ -49,8 +52,40 @@ async function showDatasetSummary(path){
   try{
     const data=await api(`/api/dataset-summary?path=${encodeURIComponent(path)}`), s=data.summary;
     box.classList.remove('hidden');
-    box.innerHTML=`<b>Dataset Ready</b><div class="summary-grid"><span>Accepted <strong>${s.accepted_charts}</strong></span><span>Rejected <strong>${s.rejected_charts}</strong></span><span>Unique Audio <strong>${s.unique_audio}</strong></span><span>Train / Val / Test <strong>${s.splits?.train ?? 0} / ${s.splits?.validation ?? 0} / ${s.splits?.test ?? 0}</strong></span></div>`;
+    box.innerHTML=`<b>Dataset Ready</b><div class="summary-grid"><span>Accepted <strong>${s.accepted_charts}</strong></span><span>Rejected <strong>${s.rejected_charts}</strong></span><span>Unique Audio <strong>${s.unique_audio}</strong></span><span>Failed Audio <strong>${s.failed_unique_audio ?? 0}</strong></span><span>Train / Val / Test <strong>${s.splits?.train ?? 0} / ${s.splits?.validation ?? 0} / ${s.splits?.test ?? 0}</strong></span></div>`;
   }catch{ box.classList.add('hidden'); }
+}
+
+async function refreshDatasetReadiness(){
+  const box=$('#datasetReadiness');
+  const path=$('#trainDataPath').value.trim();
+  if(!path){
+    datasetReady=false;
+    box.className='summary-box warning';
+    box.innerHTML='<b>Dataset 路径为空</b><p>先指定清洗输出目录。</p>';
+    updateTrainButton();
+    return;
+  }
+  try{
+    const data=await api(`/api/dataset-status?path=${encodeURIComponent(path)}`);
+    datasetReady=Boolean(data.ready);
+    const s=data.summary || {}, st=data.state || {};
+    if(data.ready){
+      box.className='summary-box ready';
+      box.innerHTML=`<b>✓ Dataset Ready · 训练已解锁</b><div class="summary-grid"><span>Accepted <strong>${s.accepted_charts ?? '—'}</strong></span><span>Rejected <strong>${s.rejected_charts ?? '—'}</strong></span><span>Unique Audio <strong>${s.unique_audio ?? '—'}</strong></span><span>Train / Val / Test <strong>${s.splits?.train ?? 0} / ${s.splits?.validation ?? 0} / ${s.splits?.test ?? 0}</strong></span></div>`;
+    }else{
+      const processed=st.processed ?? 0, total=st.total_scanned_accepted ?? '—';
+      const partial=(data.partial_index_exists || data.partial_rejected_exists) ? '有 partial checkpoint，可复用已有缓存' : '尚无 partial checkpoint';
+      const err=st.last_error ? `<p><strong>Last error:</strong> ${st.last_error}</p>` : '';
+      box.className='summary-box warning';
+      box.innerHTML=`<b>⚠ Dataset ${String(data.status).toUpperCase()} · 训练已锁定</b><div class="summary-grid"><span>Processed <strong>${processed} / ${total}</strong></span><span>Final index <strong>${data.index_exists?'✓':'✗'}</strong></span><span>Summary <strong>${data.summary_exists?'✓':'✗'}</strong></span><span>${partial}</span></div>${err}`;
+    }
+  }catch(e){
+    datasetReady=false;
+    box.className='summary-box warning';
+    box.innerHTML=`<b>⚠ Dataset 状态无法读取 · 训练已锁定</b><p>${e.message}</p>`;
+  }
+  updateTrainButton();
 }
 
 function renderPrepare(job){
@@ -61,8 +96,16 @@ function renderPrepare(job){
   $('#prepareProgress').style.width=`${Math.max(0,Math.min(100,percent))}%`;
   setText('#prepareCount', p.total ? `${p.current ?? 0} / ${p.total} (${fmt(percent,1)}%)` : '—');
   setText('#prepareAudio', p.unique_audio ?? '—');
-  setText('#prepareAccepted', p.accepted!=null ? `${p.accepted} / ${p.rejected ?? 0}` : '—');
+  const extra=p.failed_unique_audio ? ` · bad audio ${p.failed_unique_audio}` : '';
+  setText('#prepareAccepted', p.accepted!=null ? `${p.accepted} / ${p.rejected ?? 0}${extra}` : '—');
   $('#prepareLog').textContent=logsText(job.logs);
+  const failure=$('#prepareFailure');
+  if(job.state==='failed'){
+    failure.classList.remove('hidden');
+    failure.innerHTML=`<b>Dataset Builder failed</b><p>${job.failure_reason || p.last_error || '查看下方日志获取异常原因。'}</p><small>已经写入的 audio/chart cache 与 partial checkpoint 会保留。</small>`;
+  }else{
+    failure.classList.add('hidden');
+  }
   if(job.paths?.output){
     $('#outputPath').value=job.paths.output;
     if(!job.running) $('#trainDataPath').value=job.paths.output;
@@ -71,6 +114,7 @@ function renderPrepare(job){
 }
 
 function renderTrain(job){
+  trainRunning=Boolean(job.running);
   setText('#trainState', job.state);
   const records=job.records || [], last=records[records.length-1] || {};
   setText('#epoch', last.epoch ?? job.progress?.epoch ?? '—');
@@ -81,30 +125,42 @@ function renderTrain(job){
   renderLoss(records);
   if(job.paths?.data) $('#trainDataPath').value=job.paths.data;
   if(job.paths?.run_dir) $('#runDir').value=job.paths.run_dir;
+  updateTrainButton();
 }
 
 async function pollJobs(){
-  try{const data=await api('/api/jobs');renderPrepare(data.prepare);renderTrain(data.train);}catch(e){console.error(e)}
+  try{
+    const data=await api('/api/jobs');
+    renderPrepare(data.prepare);
+    renderTrain(data.train);
+    await refreshDatasetReadiness();
+  }catch(e){console.error(e)}
 }
 
 $('#prepareStart').addEventListener('click', async()=>{
   savePaths();
+  datasetReady=false; updateTrainButton();
+  $('#datasetReadiness').className='summary-box warning';
+  $('#datasetReadiness').innerHTML='<b>Dataset Builder 正在启动…训练已锁定</b>';
   try{
     const body={source_path:$('#sourcePath').value,output_path:$('#outputPath').value,config_path:$('#prepareConfig').value};
     const data=await postJson('/api/prepare/start',body);
     $('#trainDataPath').value=data.output;
     await pollJobs();
-  }catch(e){alert(e.message)}
+  }catch(e){alert(e.message);await refreshDatasetReadiness()}
 });
 $('#prepareStop').addEventListener('click', async()=>{try{await postJson('/api/prepare/stop',{});await pollJobs()}catch(e){alert(e.message)}});
 $('#trainStart').addEventListener('click', async()=>{
   savePaths();
+  if(!datasetReady) return;
   try{
     await postJson('/api/train/start',{data_path:$('#trainDataPath').value,run_dir:$('#runDir').value,config_path:$('#trainConfig').value});
     await pollJobs();
   }catch(e){alert(e.message)}
 });
 $('#trainStop').addEventListener('click', async()=>{try{await postJson('/api/train/stop',{});await pollJobs()}catch(e){alert(e.message)}});
+$('#trainDataPath').addEventListener('change', refreshDatasetReadiness);
+$('#trainDataPath').addEventListener('blur', refreshDatasetReadiness);
 
 async function inspect(file){
   const box=$('#inspectResult'); box.classList.remove('hidden'); box.innerHTML='正在检查 4K / timing / 1/96 量化…';
