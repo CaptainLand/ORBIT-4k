@@ -115,13 +115,16 @@ def main() -> None:
         pin_memory=device.type == "cuda",
     ) if val_ds.rows else None
 
-    model = Orbit4KV0(n_mels=config["audio"]["n_mels"],
+    model = Orbit4KV0(
+        audio_token_dim=config["model"]["audio_token_dim"],
         d_model=config["model"]["d_model"],
         n_heads=config["model"]["n_heads"],
         audio_layers=config["model"]["audio_layers"],
         chart_layers=config["model"]["chart_layers"],
         dim_feedforward=config["model"]["dim_feedforward"],
         dropout=config["model"]["dropout"],
+        local_audio_scale_ticks=config["model"]["local_audio_scale_ticks"],
+        max_cross_attention_bias=config["model"]["max_cross_attention_bias"],
     )
 
     model = model.to(device)
