@@ -13,14 +13,14 @@
     <section class="hero">
       <div>
         <p class="eyebrow">END-TO-END 4K CHART TRANSFORMER</p>
-        <h1>让模型直接听音乐，<br><span>直接写出最终四轨谱面。</span></h1>
-        <p class="lede">V0 固定 BPM / Offset，以 1/96 全音符网格对齐音频与谱面。Audio Encoder 与 Chart Decoder 联合训练，不经过独立采音器。</p>
+        <h1>让模型按节拍切开音乐，<br><span>直接写出最终四轨谱面。</span></h1>
+        <p class="lede">V0 固定 BPM / Offset，以 1/96 网格同步音频与谱面。每格覆盖前后 ±1/192 的真实音频片段，同时保留原始响度、整曲归一化频谱和局部动态。</p>
         <div class="actions"><a class="primary" href="#dataset">检查谱面包</a><a class="ghost" href="#train">训练流程</a></div>
       </div>
       <div class="visual-card">
         <div class="grid-demo" id="gridDemo"></div>
         <div class="signal"></div>
-        <div class="visual-label"><b>AUDIO MEMORY</b><span>Cross Attention → 4 × 4 states</span></div>
+        <div class="visual-label"><b>BEAT-SYNCHRONOUS AUDIO MEMORY</b><span>520-d token → 384-d hidden → 4 × 4 states</span></div>
       </div>
     </section>
 
@@ -32,14 +32,25 @@
     </section>
 
     <section class="panel architecture">
-      <header><div><p class="eyebrow">ARCHITECTURE</p><h2>一个端到端目标，两类注意力</h2></div></header>
+      <header><div><p class="eyebrow">AUDIO TOKENIZER</p><h2>一个 1/96 格，不再只是一个瞬时采样点</h2></div></header>
       <div class="flow">
-        <div class="node accent"><small>INPUT</small><b>Log-Mel Audio</b><span>128 bins</span></div><i>→</i>
-        <div class="node"><small>BIDIRECTIONAL</small><b>Audio Encoder</b><span>6 × Transformer</span></div><i>⇢</i>
-        <div class="node"><small>CAUSAL + CROSS</small><b>Chart Decoder</b><span>8 × Transformer</span></div><i>→</i>
+        <div class="node accent"><small>LOCAL WINDOW</small><b>± 1/192 Audio</b><span>5-point beat pooling</span></div><i>→</i>
+        <div class="node"><small>4 SPECTRAL VIEWS</small><b>512 dims</b><span>Raw / Normalized / Flux / Contrast</span></div><i>+</i>
+        <div class="node"><small>DYNAMICS</small><b>8 dims</b><span>Absolute + relative energy</span></div><i>→</i>
+        <div class="node accent"><small>AUDIO TOKEN</small><b>520 → 384</b><span>One token per chart tick</span></div>
+      </div>
+      <div class="chips"><span>Raw Mel</span><span>Song-normalized Mel</span><span>Spectral flux</span><span>Local contrast</span><span>RMS / bands</span><span>Song-relative energy</span></div>
+    </section>
+
+    <section class="panel architecture">
+      <header><div><p class="eyebrow">ARCHITECTURE</p><h2>同 tick 强绑定，前后音乐仍然可见</h2></div></header>
+      <div class="flow">
+        <div class="node accent"><small>INPUT</small><b>Beat Audio Tokens</b><span>520 dims</span></div><i>→</i>
+        <div class="node"><small>BIDIRECTIONAL</small><b>Audio Encoder</b><span>6 × Transformer + time position</span></div><i>⇢</i>
+        <div class="node"><small>CAUSAL + CROSS</small><b>Chart Decoder</b><span>same-tick fusion + soft local bias</span></div><i>→</i>
         <div class="node accent"><small>OUTPUT</small><b>[T, 4, 4]</b><span>Empty / Tap / LN start / end</span></div>
       </div>
-      <div class="chips"><span>BPM</span><span>Offset</span><span>Beat phase</span><span>Measure phase</span><span>Star rating</span><span>Previous chart</span></div>
+      <div class="chips"><span>BPM</span><span>Offset</span><span>Beat phase</span><span>Measure phase</span><span>Absolute tick position</span><span>Star rating</span><span>Previous chart</span></div>
     </section>
 
     <section class="panel" id="dataset">
@@ -52,14 +63,14 @@
     </section>
 
     <section class="panel" id="train">
-      <header><div><p class="eyebrow">LOCAL TRAINING</p><h2>Pull 下来即可开始准备数据</h2></div></header>
+      <header><div><p class="eyebrow">LOCAL TRAINING</p><h2>Pull 后先重建 V2 音频缓存</h2></div></header>
       <div class="steps">
         <div><em>01</em><b>安装</b><code>pip install -e .</code></div>
         <div><em>02</em><b>清洗 Songs</b><code>python scripts/prepare_dataset.py "D:\\osu!\\Songs"</code></div>
         <div><em>03</em><b>检查 summary</b><code>data/processed/v0/summary.json</code></div>
         <div><em>04</em><b>训练 V0</b><code>python scripts/train_v0.py</code></div>
       </div>
-      <p class="note">数据 split 按音频 SHA-1 分组，同一首歌的所有难度必定进入同一个 train / validation / test split，避免音频泄漏。</p>
+      <p class="note">音频缓存格式已升级。旧的 data/processed/v0/audio 会由准备脚本自动重建。数据 split 仍按音频 SHA-1 分组，同一首歌的所有难度不会跨 split。</p>
     </section>
     <footer>ORBIT-4K · Research baseline · CaptainLand</footer>
   </main>
