@@ -37,6 +37,8 @@ def config(path: Path = CONFIG_PATH) -> dict:
 
 
 def resolve_path(value: str) -> Path:
+    if not value or not value.strip():
+        raise HTTPException(400, "path must not be empty")
     expanded = os.path.expandvars(os.path.expanduser(value.strip()))
     path = Path(expanded)
     if not path.is_absolute():
