@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from orbit4k.model import Orbit4KV0, parameter_count
+from orbit4k.preprocessing.audio_features import AUDIO_FEATURE_VERSION, AUDIO_TOKEN_DIM
 from orbit4k.preprocessing.build_dataset import _safe_extract
 from orbit4k.preprocessing.osu_parser import scan_4k_beatmaps
 
@@ -35,13 +36,15 @@ def index():
 def status():
     cfg = config()
     model = Orbit4KV0(
-        n_mels=cfg["audio"]["n_mels"],
+        audio_token_dim=cfg["model"]["audio_token_dim"],
         d_model=cfg["model"]["d_model"],
         n_heads=cfg["model"]["n_heads"],
         audio_layers=cfg["model"]["audio_layers"],
         chart_layers=cfg["model"]["chart_layers"],
         dim_feedforward=cfg["model"]["dim_feedforward"],
         dropout=cfg["model"]["dropout"],
+        local_audio_scale_ticks=cfg["model"]["local_audio_scale_ticks"],
+        max_cross_attention_bias=cfg["model"]["max_cross_attention_bias"],
     )
     summary_path = ROOT / "data" / "processed" / "v0" / "summary.json"
     dataset = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else None
@@ -49,7 +52,9 @@ def status():
         "version": "V0",
         "parameters": parameter_count(model),
         "grid": "1/96 whole note (24 ticks / quarter)",
-        "model": "Bidirectional Audio Encoder + Causal Chart Decoder",
+        "model": "Beat-synchronous Audio Encoder + Causal Chart Decoder",
+        "audio_token_dim": AUDIO_TOKEN_DIM,
+        "audio_feature_version": AUDIO_FEATURE_VERSION,
         "dataset": dataset,
         "checkpoint_ready": (ROOT / "runs" / "v0" / "best.pt").exists(),
     }
