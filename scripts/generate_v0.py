@@ -24,6 +24,20 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--measures", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260820)
+    parser.add_argument(
+        "--onset-threshold",
+        type=float,
+        default=0.0,
+        help="0 = auto from target SR; otherwise onset-head gate in [0,1]",
+    )
+    parser.add_argument("--lane-threshold", type=float, default=0.32)
+    parser.add_argument("--ln-start-margin", type=float, default=1.25)
+    parser.add_argument(
+        "--max-chord",
+        type=int,
+        default=0,
+        help="0 = auto from target SR; otherwise 1..4",
+    )
     args = parser.parse_args()
 
     # Keep stdout robust even when launched from a GBK/CP936 Windows shell.
@@ -42,6 +56,10 @@ def main() -> None:
         temperature=args.temperature,
         measures=args.measures,
         seed=args.seed,
+        onset_threshold=args.onset_threshold,
+        lane_threshold=args.lane_threshold,
+        ln_start_margin=args.ln_start_margin,
+        max_chord=args.max_chord,
         progress_callback=_progress,
     )
     print(json.dumps(result, ensure_ascii=True), flush=True)
