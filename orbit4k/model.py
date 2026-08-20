@@ -95,8 +95,7 @@ class Orbit4KV0(nn.Module):
 
         # Preserve lane identity explicitly. Each lane owns a fixed slice of the
         # chart token, so [TAP, EMPTY, EMPTY, EMPTY] and
-        # [EMPTY, EMPTY, EMPTY, TAP] can never collapse merely because they
-        # contain the same multiset of states.
+        # [EMPTY, EMPTY, EMPTY, TAP] cannot collapse to the same representation.
         self.state_embedding = nn.Embedding(5, self.lane_dim)
         self.lane_embedding = nn.Embedding(4, self.lane_dim)
         self.active_ln_embedding = nn.Embedding(2, self.lane_dim)
@@ -154,8 +153,6 @@ class Orbit4KV0(nn.Module):
             + self.active_ln_embedding(active_ln)
             + lane_bias
         )
-        # [B, T, 4, lane_dim] -> [B, T, 4 * lane_dim]. Concatenation,
-        # rather than averaging, keeps every lane in a distinct feature slice.
         chart = self.chart_projection(lane_features.flatten(start_dim=2))
         chart = (
             chart
@@ -175,12 +172,73 @@ class Orbit4KV0(nn.Module):
         )
         return mask.masked_fill(upper, float("-inf"))
 
-    def _memory_bias(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        positions = torch.arange(length, device=device, dtype=torch.float32)
-        distance = (positions[:, None] - positions[None, :]).abs()
+    def _memory_bias_rect(
+        self,
+        target_length: int,
+        memory_length: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        target_positions = torch.arange(target_length, device=device, dtype=torch.float32)
+        memory_positions = torch.arange(memory_length, device=device, dtype=torch.float32)
+        distance = (target_positions[:, None] - memory_positions[None, :]).abs()
         bias = -(distance / max(self.local_audio_scale_ticks, 1.0))
         bias = bias.clamp(min=-self.max_cross_attention_bias, max=0.0)
         return bias.to(dtype=dtype)
+
+    def _memory_bias(self, length: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        return self._memory_bias_rect(length, length, device, dtype)
+
+    def encode_audio(
+        self,
+        audio: torch.Tensor,
+        tick: torch.Tensor,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Encode audio once so autoregressive generation can reuse the memory."""
+        audio_hidden = self._audio_embeddings(audio, tick)
+        padding_bool = None if mask is None else mask <= 0.5
+        memory = self.audio_encoder(audio_hidden, src_key_padding_mask=padding_bool)
+        return memory, padding_bool
+
+    def decode_from_memory(
+        self,
+        memory: torch.Tensor,
+        chart_input: torch.Tensor,
+        active_ln: torch.Tensor,
+        tick: torch.Tensor,
+        bpm: torch.Tensor,
+        stars: torch.Tensor,
+        *,
+        target_mask: torch.Tensor | None = None,
+        memory_padding_bool: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        target_length = chart_input.shape[1]
+        memory_length = memory.shape[1]
+        if target_length > memory_length:
+            raise ValueError("chart prefix cannot be longer than encoded audio memory")
+
+        chart_hidden = self._chart_embeddings(chart_input, active_ln, tick, bpm, stars)
+        gate = torch.sigmoid(self.same_tick_audio_gate).view(1, 1, -1)
+        chart_hidden = chart_hidden + gate * self.same_tick_audio_norm(memory[:, :target_length])
+
+        target_padding_bool = None if target_mask is None else target_mask <= 0.5
+        decoded = self.chart_decoder(
+            chart_hidden,
+            memory,
+            tgt_mask=self._causal_mask(target_length, chart_hidden.device, chart_hidden.dtype),
+            memory_mask=self._memory_bias_rect(
+                target_length,
+                memory_length,
+                chart_hidden.device,
+                chart_hidden.dtype,
+            ),
+            tgt_key_padding_mask=target_padding_bool,
+            memory_key_padding_mask=memory_padding_bool,
+        )
+        logits = self.state_head(decoded).view(decoded.shape[0], decoded.shape[1], 4, 4)
+        onset_logits = self.onset_head(decoded).squeeze(-1)
+        return {"logits": logits, "onset_logits": onset_logits, "hidden": decoded}
 
     def forward(
         self,
@@ -192,36 +250,17 @@ class Orbit4KV0(nn.Module):
         stars: torch.Tensor,
         mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
-        audio_hidden = self._audio_embeddings(audio, tick)
-        padding_bool = None if mask is None else mask <= 0.5
-        memory = self.audio_encoder(audio_hidden, src_key_padding_mask=padding_bool)
-
-        decoder_padding = None
-        if padding_bool is not None:
-            decoder_padding = torch.zeros_like(mask, dtype=audio_hidden.dtype).masked_fill(
-                padding_bool,
-                float("-inf"),
-            )
-
-        chart_hidden = self._chart_embeddings(chart_input, active_ln, tick, bpm, stars)
-        gate = torch.sigmoid(self.same_tick_audio_gate).view(1, 1, -1)
-        chart_hidden = chart_hidden + gate * self.same_tick_audio_norm(memory)
-
-        decoded = self.chart_decoder(
-            chart_hidden,
+        memory, padding_bool = self.encode_audio(audio, tick, mask)
+        return self.decode_from_memory(
             memory,
-            tgt_mask=self._causal_mask(
-                chart_hidden.shape[1], chart_hidden.device, chart_hidden.dtype
-            ),
-            memory_mask=self._memory_bias(
-                chart_hidden.shape[1], chart_hidden.device, chart_hidden.dtype
-            ),
-            tgt_key_padding_mask=decoder_padding,
-            memory_key_padding_mask=decoder_padding,
+            chart_input,
+            active_ln,
+            tick,
+            bpm,
+            stars,
+            target_mask=mask,
+            memory_padding_bool=padding_bool,
         )
-        logits = self.state_head(decoded).view(decoded.shape[0], decoded.shape[1], 4, 4)
-        onset_logits = self.onset_head(decoded).squeeze(-1)
-        return {"logits": logits, "onset_logits": onset_logits, "hidden": decoded}
 
     @torch.inference_mode()
     def generate_window(
@@ -232,7 +271,15 @@ class Orbit4KV0(nn.Module):
         stars: torch.Tensor,
         *,
         temperature: float = 0.9,
+        progress_callback=None,
     ) -> torch.Tensor:
+        """Autoregressively generate a window while caching Audio Encoder memory.
+
+        V0 still recomputes the causal Chart Decoder prefix at every tick because
+        ``nn.TransformerDecoder`` does not expose a KV cache. Caching audio removes
+        the largest avoidable repeated encoder cost and keeps the implementation
+        identical to training semantics.
+        """
         self.eval()
         batch, length, _ = audio.shape
         result = torch.zeros((batch, length, 4), dtype=torch.long, device=audio.device)
@@ -240,15 +287,32 @@ class Orbit4KV0(nn.Module):
         active_ln = torch.zeros_like(result)
         active_now = torch.zeros((batch, 4), dtype=torch.long, device=audio.device)
         mask = torch.ones((batch, length), dtype=torch.float32, device=audio.device)
+        memory, memory_padding = self.encode_audio(audio, tick, mask)
+
+        report_every = max(1, length // 100)
         for position in range(length):
             if position > 0:
                 chart_input[:, position] = result[:, position - 1]
             active_ln[:, position] = active_now
-            outputs = self(audio, chart_input, active_ln, tick, bpm, stars, mask)
-            logits = outputs["logits"][:, position] / max(temperature, 1e-4)
+            prefix = position + 1
+            outputs = self.decode_from_memory(
+                memory,
+                chart_input[:, :prefix],
+                active_ln[:, :prefix],
+                tick[:, :prefix],
+                bpm,
+                stars,
+                target_mask=mask[:, :prefix],
+                memory_padding_bool=memory_padding,
+            )
+            logits = outputs["logits"][:, -1] / max(temperature, 1e-4)
             result[:, position] = torch.distributions.Categorical(logits=logits).sample()
             active_now = torch.where(result[:, position] == 2, 1, active_now)
             active_now = torch.where(result[:, position] == 3, 0, active_now)
+            if progress_callback is not None and (
+                position == 0 or position + 1 == length or (position + 1) % report_every == 0
+            ):
+                progress_callback(position + 1, length)
         return result
 
 
