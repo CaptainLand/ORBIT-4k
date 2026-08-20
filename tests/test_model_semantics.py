@@ -70,3 +70,28 @@ def test_forward_keeps_expected_output_shape():
 
     assert outputs["logits"].shape == (batch, length, 4, 4)
     assert outputs["onset_logits"].shape == (batch, length)
+
+
+def test_cached_audio_generation_keeps_chart_shape():
+    torch.manual_seed(3)
+    model = _tiny_model()
+    length = 6
+    audio = torch.randn(1, length, 520)
+    tick = torch.arange(length).unsqueeze(0)
+    bpm = torch.tensor([180.0])
+    stars = torch.tensor([5.0])
+    progress = []
+
+    generated = model.generate_window(
+        audio,
+        tick,
+        bpm,
+        stars,
+        temperature=0.8,
+        progress_callback=lambda current, total: progress.append((current, total)),
+    )
+
+    assert generated.shape == (1, length, 4)
+    assert generated.min() >= 0
+    assert generated.max() <= 3
+    assert progress[-1] == (length, length)
