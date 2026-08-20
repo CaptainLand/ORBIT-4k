@@ -2,7 +2,7 @@ const $ = q => document.querySelector(q);
 const formatParams = n => n ? `${(n/1e6).toFixed(2)}M` : '—';
 const fmt = (n, d=4) => Number.isFinite(Number(n)) ? Number(n).toFixed(d) : '—';
 const savedKeys = [
-  'sourcePath','outputPath','prepareConfig','trainDataPath','runDir','trainConfig',
+  'sourcePath','outputPath','prepareConfig','trainArchitecture','trainDataPath','runDir','trainConfig','trainWarmStart',
   'genCheckpoint','genAudio','genOutput','genBpm','genOffset','genStars',
   'genMode','genTemperature','genMeasures','genWindowMeasures','genContextMeasures','genSeed'
 ];
@@ -12,7 +12,7 @@ let generateRunning = false;
 
 function savePaths(){ savedKeys.forEach(k => { const el=$(`#${k}`); if(el) localStorage.setItem(`orbit4k:${k}`, el.value); }); }
 function restorePaths(){ savedKeys.forEach(k => { const el=$(`#${k}`), v=localStorage.getItem(`orbit4k:${k}`); if(el&&v!=null) el.value=v; }); }
-function setText(id, value){ $(id).textContent = value ?? '—'; }
+function setText(id, value){ const el=$(id); if(el) el.textContent = value ?? '—'; }
 function logsText(lines){ return (lines && lines.length ? lines.slice(-80).join('\n') : '—'); }
 function updateTrainButton(){ $('#trainStart').disabled = trainRunning || generateRunning || !datasetReady; }
 function updateGenerateButton(){ $('#genStart').disabled = generateRunning || trainRunning; }
@@ -21,6 +21,15 @@ function updateGenerationModeUI(){
   $('#previewSettings').classList.toggle('hidden', full);
   $('#fullSongSettings').classList.toggle('hidden', !full);
   $('#genStart').textContent=full?'生成整首谱面':'生成预览谱';
+}
+function updateTrainingArchitectureUI(forceDefaults=false){
+  const v1=$('#trainArchitecture').value==='v1';
+  $('#trainWarmStart').disabled=!v1;
+  if(forceDefaults){
+    $('#runDir').value=v1?'runs/v1':'runs/v0';
+    $('#trainConfig').value=v1?'configs/v1.yaml':'configs/v0.yaml';
+    if(v1 && !$('#trainWarmStart').value.trim()) $('#trainWarmStart').value='runs/v0/best.pt';
+  }
 }
 
 async function api(url, options={}){
@@ -84,7 +93,8 @@ async function refreshDatasetReadiness(){
     const s=data.summary || {}, st=data.state || {};
     if(data.ready){
       box.className='summary-box ready';
-      box.innerHTML=`<b>✓ Dataset Ready · 训练已解锁</b><div class="summary-grid"><span>Accepted <strong>${s.accepted_charts ?? '—'}</strong></span><span>Rejected <strong>${s.rejected_charts ?? '—'}</strong></span><span>Unique Audio <strong>${s.unique_audio ?? '—'}</strong></span><span>Train / Val / Test <strong>${s.splits?.train ?? 0} / ${s.splits?.validation ?? 0} / ${s.splits?.test ?? 0}</strong></span></div>`;
+      const arch=$('#trainArchitecture').value==='v1'?'V1 32×3 会直接复用这份 1/96 cache':'V0 flat 1/96';
+      box.innerHTML=`<b>✓ Dataset Ready · ${arch}</b><div class="summary-grid"><span>Accepted <strong>${s.accepted_charts ?? '—'}</strong></span><span>Rejected <strong>${s.rejected_charts ?? '—'}</strong></span><span>Unique Audio <strong>${s.unique_audio ?? '—'}</strong></span><span>Train / Val / Test <strong>${s.splits?.train ?? 0} / ${s.splits?.validation ?? 0} / ${s.splits?.test ?? 0}</strong></span></div>`;
     }else{
       const processed=st.processed ?? 0, total=st.total_scanned_accepted ?? '—';
       const partial=(data.partial_index_exists || data.partial_rejected_exists) ? '有 partial checkpoint，可复用已有缓存' : '尚无 partial checkpoint';
@@ -127,17 +137,24 @@ function renderTrain(job){
   trainRunning=Boolean(job.running);
   setText('#trainState', job.state);
   const records=job.records || [], last=records[records.length-1] || {};
+  const arch=last.architecture ?? job.progress?.architecture ?? job.paths?.architecture ?? $('#trainArchitecture').value;
+  const memory=last.gpu_memory ?? job.progress?.gpu_memory ?? {};
+  setText('#trainArch', arch==='v1_32x3' || arch==='v1' ? 'V1 · 32×3' : (arch==='v0' ? 'V0 · 1/96' : arch || '—'));
   setText('#epoch', last.epoch ?? job.progress?.epoch ?? '—');
   setText('#trainLoss', fmt(last.train?.loss ?? job.progress?.train?.loss));
   setText('#valLoss', fmt(last.validation?.loss ?? job.progress?.validation?.loss));
   setText('#lr', last.learning_rate!=null ? Number(last.learning_rate).toExponential(2) : '—');
+  setText('#peakVram', memory.peak_allocated_mb!=null ? `${fmt(memory.peak_allocated_mb,1)} MB` : '—');
   $('#trainLog').textContent=logsText(job.logs);
   renderLoss(records);
+  if(job.paths?.architecture){ $('#trainArchitecture').value=job.paths.architecture; updateTrainingArchitectureUI(false); }
   if(job.paths?.data) $('#trainDataPath').value=job.paths.data;
   if(job.paths?.run_dir){
     $('#runDir').value=job.paths.run_dir;
-    if(job.state==='completed') $('#genCheckpoint').value=`${job.paths.run_dir}\\best.pt`;
+    if(job.state==='completed' && job.paths?.architecture==='v0') $('#genCheckpoint').value=`${job.paths.run_dir}\\best.pt`;
   }
+  if(job.paths?.config) $('#trainConfig').value=job.paths.config;
+  if(job.paths?.warm_start_v0 && job.paths.warm_start_v0.trim()) $('#trainWarmStart').value=job.paths.warm_start_v0;
   updateTrainButton();
   updateGenerateButton();
 }
@@ -209,11 +226,22 @@ $('#prepareStart').addEventListener('click', async()=>{
 });
 $('#prepareStop').addEventListener('click', async()=>{try{await postJson('/api/prepare/stop',{});await pollJobs()}catch(e){alert(e.message)}});
 
+$('#trainArchitecture').addEventListener('change',()=>{
+  updateTrainingArchitectureUI(true);
+  savePaths();
+  refreshDatasetReadiness();
+});
 $('#trainStart').addEventListener('click', async()=>{
   savePaths();
   if(!datasetReady) return;
   try{
-    await postJson('/api/train/start',{data_path:$('#trainDataPath').value,run_dir:$('#runDir').value,config_path:$('#trainConfig').value});
+    await postJson('/api/train/start',{
+      architecture:$('#trainArchitecture').value,
+      data_path:$('#trainDataPath').value,
+      run_dir:$('#runDir').value,
+      config_path:$('#trainConfig').value,
+      warm_start_v0:$('#trainArchitecture').value==='v1' ? $('#trainWarmStart').value : null,
+    });
     await pollJobs();
   }catch(e){alert(e.message)}
 });
@@ -261,4 +289,8 @@ input.addEventListener('change',()=>input.files[0]&&inspect(input.files[0]));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.classList.remove('drag')}));
 drop.addEventListener('drop',e=>e.dataTransfer.files[0]&&inspect(e.dataTransfer.files[0]));
 
-restorePaths(); updateGenerationModeUI(); buildGrid(); loadStatus(); pollJobs(); setInterval(pollJobs,1000);
+const hadSavedArchitecture=localStorage.getItem('orbit4k:trainArchitecture')!=null;
+restorePaths();
+updateTrainingArchitectureUI(!hadSavedArchitecture);
+updateGenerationModeUI();
+buildGrid(); loadStatus(); pollJobs(); setInterval(pollJobs,1000);
