@@ -39,7 +39,7 @@ def build_dataset(config: dict, data_root: Path, split: str) -> Orbit4KCellDatas
         stride_measures=config["window"]["stride_measures"],
         random_crop=split == "train",
         random_samples_per_chart=int(config["window"].get("train_samples_per_chart", 4)),
-        audio_cache_size=int(config.get("dataset", {}).get("audio_cache_size", 4)),
+        audio_cache_size=int(config.get("dataset", {}).get("audio_cache_size", 1)),
     )
 
 
@@ -128,13 +128,26 @@ def run_epoch(model, loader, optimizer, scaler, scheduler, config, device, train
             totals[key] = totals.get(key, 0.0) + float(value)
         count += 1
 
-        # Make tensor lifetimes explicit. This should not be necessary for
-        # correctness, but it prevents accidental graph retention when the
-        # training loop evolves and makes large-dataset memory behavior easier
-        # to reason about.
+        # Make tensor lifetimes explicit so future metric/logging changes cannot
+        # accidentally retain computation graphs across a large epoch.
         del tensor_batch, outputs, loss, scaled_loss
 
     return {key: value / max(1, count) for key, value in totals.items()}
+
+
+def _restore_scheduler_position(
+    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    optimizer: torch.optim.Optimizer,
+    completed_steps: int,
+    lr_scale,
+) -> None:
+    """Restore schedule position for legacy V1 checkpoints without scheduler state."""
+    completed_steps = max(0, int(completed_steps))
+    scheduler.last_epoch = completed_steps
+    scheduler._step_count = completed_steps + 1
+    for base_lr, group in zip(scheduler.base_lrs, optimizer.param_groups):
+        group["lr"] = float(base_lr) * float(lr_scale(completed_steps))
+    scheduler._last_lr = [group["lr"] for group in optimizer.param_groups]
 
 
 def main() -> None:
@@ -148,10 +161,16 @@ def main() -> None:
         default=None,
         help="optional V0 best.pt; reuses Transformer backbone and compatible embeddings",
     )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help="ignore run-dir/last.pt and start a fresh V1 run",
+    )
     args = parser.parse_args()
     config = load_config(args.config)
     seed_everything(int(config["seed"]))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    args.run_dir.mkdir(parents=True, exist_ok=True)
 
     train_ds = build_dataset(config, args.data, "train")
     val_ds = build_dataset(config, args.data, "validation")
@@ -166,7 +185,7 @@ def main() -> None:
         "persistent_workers": workers > 0,
     }
     if workers > 0:
-        loader_kwargs["prefetch_factor"] = int(config.get("dataset", {}).get("prefetch_factor", 2))
+        loader_kwargs["prefetch_factor"] = int(config.get("dataset", {}).get("prefetch_factor", 1))
 
     train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs) if val_ds.rows else None
@@ -186,8 +205,34 @@ def main() -> None:
         max_cross_attention_bias=config["model"]["max_cross_attention_bias"],
     )
 
+    resume_checkpoint = None
+    resume_path = args.run_dir / "last.pt"
+    start_epoch = 1
+    best = float("inf")
     warm_start_report = None
-    if args.warm_start_v0 is not None:
+
+    if resume_path.is_file() and not args.restart:
+        resume_checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        if resume_checkpoint.get("architecture") != "v1_32x3":
+            raise RuntimeError(f"cannot resume non-V1 checkpoint: {resume_path}")
+        model.load_state_dict(resume_checkpoint["model"], strict=True)
+        start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+        best = float(resume_checkpoint.get("best_score", resume_checkpoint.get("score", float("inf"))))
+        warm_start_report = resume_checkpoint.get("warm_start")
+        print(
+            "resume="
+            + json.dumps(
+                {
+                    "path": str(resume_path),
+                    "completed_epoch": start_epoch - 1,
+                    "next_epoch": start_epoch,
+                    "optimizer_state": "optimizer" in resume_checkpoint,
+                    "scheduler_state": "scheduler" in resume_checkpoint,
+                },
+                ensure_ascii=True,
+            )
+        )
+    elif args.warm_start_v0 is not None:
         if not args.warm_start_v0.is_file():
             raise FileNotFoundError(f"V0 warm-start checkpoint not found: {args.warm_start_v0}")
         warm_start_report = warm_start_from_v0(model, args.warm_start_v0)
@@ -221,15 +266,37 @@ def main() -> None:
         return 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_scale)
-    args.run_dir.mkdir(parents=True, exist_ok=True)
+
+    if resume_checkpoint is not None:
+        if "optimizer" in resume_checkpoint:
+            optimizer.load_state_dict(resume_checkpoint["optimizer"])
+        if "scaler" in resume_checkpoint:
+            scaler.load_state_dict(resume_checkpoint["scaler"])
+        if "scheduler" in resume_checkpoint:
+            scheduler.load_state_dict(resume_checkpoint["scheduler"])
+        else:
+            # The first V1 checkpoints did not yet save optimizer/scheduler state.
+            # Their model weights are still valuable; infer the scheduler position
+            # from the number of completed full epochs instead of restarting warmup.
+            _restore_scheduler_position(
+                scheduler,
+                optimizer,
+                (start_epoch - 1) * optimizer_steps_per_epoch,
+                lr_scale,
+            )
+
     print(
         f"device={device} parameters={parameter_count(model):,} "
         f"train_charts={len(train_ds.rows)} train_samples={len(train_ds)} "
         f"cells_per_window={train_ds.window_cells} micro_slots=3"
     )
 
-    best = float("inf")
-    for epoch in range(1, int(config["training"]["epochs"]) + 1):
+    total_epochs = int(config["training"]["epochs"])
+    if start_epoch > total_epochs:
+        print(json.dumps({"stage": "complete", "epoch": start_epoch - 1, "message": "run already complete"}))
+        return
+
+    for epoch in range(start_epoch, total_epochs + 1):
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         train_metrics = run_epoch(
@@ -259,6 +326,9 @@ def main() -> None:
                 )
 
         score = val_metrics.get("loss", train_metrics["loss"])
+        is_best = score < best
+        if is_best:
+            best = score
         record = {
             "epoch": epoch,
             "learning_rate": optimizer.param_groups[0]["lr"],
@@ -274,15 +344,18 @@ def main() -> None:
 
         checkpoint = {
             "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "scheduler": scheduler.state_dict(),
             "config": config,
             "epoch": epoch,
             "score": score,
+            "best_score": best,
             "architecture": "v1_32x3",
             "warm_start": warm_start_report,
         }
         torch.save(checkpoint, args.run_dir / "last.pt")
-        if score < best:
-            best = score
+        if is_best:
             torch.save(checkpoint, args.run_dir / "best.pt")
 
 
