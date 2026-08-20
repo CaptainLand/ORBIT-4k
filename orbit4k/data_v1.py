@@ -12,7 +12,8 @@ from torch.utils.data import Dataset
 
 from .model import BOS_STATE
 from .model_v1 import MICRO_SLOTS
-from .preprocessing.audio_features import AUDIO_FEATURE_VERSION, beat_synchronous_audio_tokens
+from .preprocessing.audio_features import AUDIO_FEATURE_VERSION
+from .preprocessing.audio_features_windowed import beat_synchronous_audio_tokens_windowed
 
 
 class Orbit4KCellDataset(Dataset):
@@ -30,7 +31,7 @@ class Orbit4KCellDataset(Dataset):
         stride_measures: int = 8,
         random_crop: bool = True,
         random_samples_per_chart: int = 4,
-        audio_cache_size: int = 4,
+        audio_cache_size: int = 2,
     ) -> None:
         self.root = Path(root)
         if micro_ticks_per_cell != MICRO_SLOTS:
@@ -86,11 +87,16 @@ class Orbit4KCellDataset(Dataset):
                     f"audio cache version {version} is incompatible with feature version "
                     f"{AUDIO_FEATURE_VERSION}; rebuild with scripts/prepare_dataset.py"
                 )
+            # Keep frame caches in their stored float16 form. Older V1 code
+            # promoted an entire long song to float32 here, so one ~60-minute
+            # cache could occupy 350+ MiB per DataLoader worker before any token
+            # computation happened. The bounded tokenizer promotes only the
+            # current training window to float32.
             value = {
-                "log_mel": data["log_mel"].astype(np.float32),
-                "mel_mean": data["mel_mean"].astype(np.float32),
-                "mel_std": data["mel_std"].astype(np.float32),
-                "log_energy": data["log_energy"].astype(np.float32),
+                "log_mel": np.asarray(data["log_mel"]),
+                "mel_mean": np.asarray(data["mel_mean"], dtype=np.float32),
+                "mel_std": np.asarray(data["mel_std"], dtype=np.float32),
+                "log_energy": np.asarray(data["log_energy"]),
                 "energy_median": float(data["energy_median"]),
                 "energy_mad": float(data["energy_mad"]),
                 "duration_ms": float(data["duration_ms"]),
@@ -165,7 +171,7 @@ class Orbit4KCellDataset(Dataset):
                         active[lane] = 0
 
         cache = self._audio(row)
-        audio_ticks = beat_synchronous_audio_tokens(
+        audio_ticks = beat_synchronous_audio_tokens_windowed(
             cache["log_mel"],
             cache["mel_mean"],
             cache["mel_std"],
