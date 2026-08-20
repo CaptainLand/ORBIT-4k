@@ -1,15 +1,21 @@
 const $ = q => document.querySelector(q);
 const formatParams = n => n ? `${(n/1e6).toFixed(2)}M` : '—';
 const fmt = (n, d=4) => Number.isFinite(Number(n)) ? Number(n).toFixed(d) : '—';
-const savedKeys = ['sourcePath','outputPath','prepareConfig','trainDataPath','runDir','trainConfig'];
+const savedKeys = [
+  'sourcePath','outputPath','prepareConfig','trainDataPath','runDir','trainConfig',
+  'genCheckpoint','genAudio','genOutput','genBpm','genOffset','genStars',
+  'genTemperature','genMeasures','genSeed'
+];
 let datasetReady = false;
 let trainRunning = false;
+let generateRunning = false;
 
 function savePaths(){ savedKeys.forEach(k => localStorage.setItem(`orbit4k:${k}`, $(`#${k}`).value)); }
 function restorePaths(){ savedKeys.forEach(k => { const v=localStorage.getItem(`orbit4k:${k}`); if(v) $(`#${k}`).value=v; }); }
 function setText(id, value){ $(id).textContent = value ?? '—'; }
 function logsText(lines){ return (lines && lines.length ? lines.slice(-80).join('\n') : '—'); }
-function updateTrainButton(){ $('#trainStart').disabled = trainRunning || !datasetReady; }
+function updateTrainButton(){ $('#trainStart').disabled = trainRunning || generateRunning || !datasetReady; }
+function updateGenerateButton(){ $('#genStart').disabled = generateRunning || trainRunning; }
 
 async function api(url, options={}){
   const r = await fetch(url, options);
@@ -103,9 +109,7 @@ function renderPrepare(job){
   if(job.state==='failed'){
     failure.classList.remove('hidden');
     failure.innerHTML=`<b>Dataset Builder failed</b><p>${job.failure_reason || p.last_error || '查看下方日志获取异常原因。'}</p><small>已经写入的 audio/chart cache 与 partial checkpoint 会保留。</small>`;
-  }else{
-    failure.classList.add('hidden');
-  }
+  }else failure.classList.add('hidden');
   if(job.paths?.output){
     $('#outputPath').value=job.paths.output;
     if(!job.running) $('#trainDataPath').value=job.paths.output;
@@ -124,8 +128,44 @@ function renderTrain(job){
   $('#trainLog').textContent=logsText(job.logs);
   renderLoss(records);
   if(job.paths?.data) $('#trainDataPath').value=job.paths.data;
-  if(job.paths?.run_dir) $('#runDir').value=job.paths.run_dir;
+  if(job.paths?.run_dir){
+    $('#runDir').value=job.paths.run_dir;
+    if(job.state==='completed') $('#genCheckpoint').value=`${job.paths.run_dir}\\best.pt`;
+  }
   updateTrainButton();
+  updateGenerateButton();
+}
+
+function renderGenerate(job){
+  generateRunning=Boolean(job.running);
+  const p=job.progress || {}, stats=p.stats || {};
+  setText('#genState', job.state);
+  setText('#genStage', p.stage || '—');
+  const percent=Number(p.percent ?? (p.stage==='complete'?100:0));
+  $('#genProgress').style.width=`${Math.max(0,Math.min(100,percent))}%`;
+  setText('#genTicks', p.total ? `${p.current ?? 0} / ${p.total}` : (p.generated_ticks ?? '—'));
+  setText('#genKeydowns', stats.keydowns ?? '—');
+  setText('#genRepairs', stats.repairs ?? '—');
+  $('#genLog').textContent=logsText(job.logs);
+
+  const result=$('#genResult'), failure=$('#genFailure');
+  if(job.state==='completed' && p.output){
+    result.className='summary-box ready';
+    result.innerHTML=`<b>✓ Preview Generated</b><p><strong>.osu:</strong> ${p.output}</p><div class="summary-grid"><span>Checkpoint epoch <strong>${p.checkpoint_epoch ?? '—'}</strong></span><span>SR <strong>${p.stars ?? '—'}</strong></span><span>Keydowns <strong>${stats.keydowns ?? '—'}</strong></span><span>Tap / LN <strong>${stats.taps ?? 0} / ${stats.ln ?? 0}</strong></span><span>Chord ticks <strong>${stats.chord_ticks ?? 0}</strong></span><span>Repairs <strong>${stats.repairs ?? 0}</strong></span></div>`;
+    result.classList.remove('hidden');
+  }else if(job.running){
+    result.classList.add('hidden');
+  }
+  if(job.state==='failed'){
+    failure.classList.remove('hidden');
+    failure.innerHTML=`<b>Preview generation failed</b><p>${job.failure_reason || p.last_error || '查看生成日志。'}</p>`;
+  }else failure.classList.add('hidden');
+
+  if(job.paths?.checkpoint) $('#genCheckpoint').value=job.paths.checkpoint;
+  if(job.paths?.audio) $('#genAudio').value=job.paths.audio;
+  if(job.paths?.output_dir) $('#genOutput').value=job.paths.output_dir;
+  updateTrainButton();
+  updateGenerateButton();
 }
 
 async function pollJobs(){
@@ -133,6 +173,7 @@ async function pollJobs(){
     const data=await api('/api/jobs');
     renderPrepare(data.prepare);
     renderTrain(data.train);
+    renderGenerate(data.generate || {state:'idle',progress:{},logs:[],paths:{}});
     await refreshDatasetReadiness();
   }catch(e){console.error(e)}
 }
@@ -150,6 +191,7 @@ $('#prepareStart').addEventListener('click', async()=>{
   }catch(e){alert(e.message);await refreshDatasetReadiness()}
 });
 $('#prepareStop').addEventListener('click', async()=>{try{await postJson('/api/prepare/stop',{});await pollJobs()}catch(e){alert(e.message)}});
+
 $('#trainStart').addEventListener('click', async()=>{
   savePaths();
   if(!datasetReady) return;
@@ -161,6 +203,26 @@ $('#trainStart').addEventListener('click', async()=>{
 $('#trainStop').addEventListener('click', async()=>{try{await postJson('/api/train/stop',{});await pollJobs()}catch(e){alert(e.message)}});
 $('#trainDataPath').addEventListener('change', refreshDatasetReadiness);
 $('#trainDataPath').addEventListener('blur', refreshDatasetReadiness);
+
+$('#genStart').addEventListener('click', async()=>{
+  savePaths();
+  $('#genResult').classList.add('hidden');
+  try{
+    await postJson('/api/generate/start',{
+      checkpoint_path:$('#genCheckpoint').value,
+      audio_path:$('#genAudio').value,
+      output_dir:$('#genOutput').value,
+      bpm:Number($('#genBpm').value),
+      offset_ms:Number($('#genOffset').value),
+      stars:Number($('#genStars').value),
+      temperature:Number($('#genTemperature').value),
+      measures:Number($('#genMeasures').value),
+      seed:Number($('#genSeed').value),
+    });
+    await pollJobs();
+  }catch(e){alert(e.message)}
+});
+$('#genStop').addEventListener('click', async()=>{try{await postJson('/api/generate/stop',{});await pollJobs()}catch(e){alert(e.message)}});
 
 async function inspect(file){
   const box=$('#inspectResult'); box.classList.remove('hidden'); box.innerHTML='正在检查 4K / timing / 1/96 量化…';
