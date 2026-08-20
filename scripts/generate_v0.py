@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from orbit4k.inference import generate_preview
+from orbit4k.inference_v3 import generate_preview
 
 
 def _progress(payload: dict) -> None:
@@ -14,7 +14,7 @@ def _progress(payload: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate an ORBIT-4K V0 preview beatmap")
+    parser = argparse.ArgumentParser(description="Generate an ORBIT-4K V0 preview beatmap with adaptive V3 decoding")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -28,7 +28,7 @@ def main() -> None:
         "--onset-threshold",
         type=float,
         default=0.0,
-        help="0 = auto from target SR; otherwise onset-head gate in [0,1]",
+        help="0 = V3 adaptive threshold; otherwise absolute onset-head ceiling in [0,1]",
     )
     parser.add_argument("--lane-threshold", type=float, default=0.32)
     parser.add_argument("--ln-start-margin", type=float, default=1.25)
