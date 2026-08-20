@@ -10,11 +10,12 @@ import numpy as np
 import torch
 
 from .inference import (
+    _auto_max_chord,
     _model_from_checkpoint,
     _safe_stem,
-    _auto_max_chord,
     chart_statistics,
     constrained_tick_states,
+    write_osu,
 )
 from .model import BOS_STATE, Orbit4KV0
 from .preprocessing.audio_features import (
@@ -25,7 +26,6 @@ from .preprocessing.audio_features import (
 from .validator import LN_END, LN_START, TAP, validate_and_repair
 
 ProgressCallback = Callable[[dict], None]
-LANE_X = (64, 192, 320, 448)
 
 
 def _emit(callback: ProgressCallback | None, **payload) -> None:
@@ -34,51 +34,45 @@ def _emit(callback: ProgressCallback | None, **payload) -> None:
 
 
 def _auto_base_threshold(stars: float) -> float:
-    """V3 absolute ceiling before local/relative adaptation.
-
-    V2 used about 0.50 at 6★. That value is too strict for an onset head trained
-    on a very sparse 1/96 grid. V3 keeps an absolute ceiling, but lets strong
-    *relative* peaks through even when their raw probability is below 0.5.
-    """
+    """Absolute V3 ceiling before local/relative adaptation."""
     return float(max(0.30, min(0.46, 0.40 - 0.012 * (float(stars) - 6.0))))
 
 
 def _auto_floor_threshold(stars: float) -> float:
-    """Never let adaptive recovery turn tiny onset noise into arbitrary notes."""
+    """Floor that keeps low-probability noise from becoming arbitrary notes."""
     return float(max(0.10, min(0.18, 0.14 - 0.006 * (float(stars) - 6.0))))
 
 
 def audio_activity_curve(tokens: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return robust 0..1 activity and a local-peak mask from Audio Feature V2.
-
-    The final eight token dimensions are energy/dynamics features. V3 uses only
-    song-relative energy, spectral flux and local-vs-context contrast, then
-    normalizes them within the requested preview. This means silence recovery is
-    allowed to become aggressive in musically active regions without forcing
-    notes into genuinely quiet passages.
-    """
+    """Build robust 0..1 activity and local-peak signals from Audio Feature V2."""
     values = np.asarray(tokens, dtype=np.float32)
     if values.ndim != 2 or values.shape[1] < 8:
         raise ValueError("expected beat-synchronous audio tokens [T,D]")
     if len(values) == 0:
         return np.zeros(0, dtype=np.float32), np.zeros(0, dtype=bool)
 
+    # Final energy feature layout: total/low/mid/high, relative, flux, contrast, median.
     relative_energy = values[:, -4]
     flux = values[:, -3]
     contrast = values[:, -2]
     raw = 0.40 * relative_energy + 0.35 * flux + 0.25 * contrast
 
-    low, high = np.quantile(raw, [0.10, 0.90]) if len(raw) >= 4 else (float(raw.min()), float(raw.max()))
+    if len(raw) >= 4:
+        low, high = np.quantile(raw, [0.10, 0.90])
+    else:
+        low, high = float(raw.min()), float(raw.max())
     span = max(float(high - low), 1e-5)
     activity = np.clip((raw - float(low)) / span, 0.0, 1.0).astype(np.float32)
 
     peaks = np.zeros(len(activity), dtype=bool)
-    radius = 3
     for index in range(len(activity)):
-        start = max(0, index - radius)
-        end = min(len(activity), index + radius + 1)
+        start = max(0, index - 3)
+        end = min(len(activity), index + 4)
         local = activity[start:end]
-        peaks[index] = bool(activity[index] >= 0.25 and activity[index] >= float(local.max()) - 1e-6)
+        peaks[index] = bool(
+            activity[index] >= 0.25
+            and activity[index] >= float(local.max()) - 1e-6
+        )
     return activity, peaks
 
 
@@ -91,15 +85,13 @@ def adaptive_onset_threshold(
     custom_threshold: float = 0.0,
     history_window: int = 24,
     relative_quantile: float = 0.85,
+    relative_margin: float = 0.025,
 ) -> float:
-    """Resolve the V3 gate threshold for one tick.
+    """Resolve one V3 onset gate from absolute, relative and silence signals.
 
-    Three mechanisms cooperate:
-    1. absolute ceiling: prevents V1-style over-generation;
-    2. rolling high quantile: treats a 0.30 peak as meaningful if neighbors are
-       around 0.05 instead of demanding a globally calibrated 0.50;
-    3. silence relaxation: after half a beat without a key-down, the gate lowers
-       gradually, but mostly when the audio features say the region is active.
+    The positive margin is important: a flat sequence such as 0.20,0.20,...
+    must not classify every tick as a relative peak merely because its q85 is
+    also 0.20. Real peaks only need to stand a little above their local baseline.
     """
     base = float(custom_threshold) if custom_threshold > 0 else _auto_base_threshold(stars)
     floor = _auto_floor_threshold(stars)
@@ -107,15 +99,15 @@ def adaptive_onset_threshold(
 
     if len(window) >= 4:
         relative = float(np.quantile(np.asarray(window, dtype=np.float32), relative_quantile))
-        threshold = min(base, max(floor, relative))
+        threshold = min(base, max(floor, relative + float(relative_margin)))
     else:
         threshold = base
 
     activity_value = float(np.clip(activity, 0.0, 1.0))
-    # Active audio may lower the gate by up to 0.04; quiet audio raises it.
-    threshold += (0.5 - activity_value) * 0.08
+    # Audio activity is a nudge, not the main gate: +/-0.02 maximum.
+    threshold += (0.5 - activity_value) * 0.04
 
-    # 24 TPQ: 12 ticks = half a beat, 36 ticks = one and a half beats.
+    # 24 TPQ: relaxation begins after half a beat and reaches full strength at 1.5 beats.
     gap_progress = float(np.clip((int(ticks_since_keydown) - 12) / 24.0, 0.0, 1.0))
     threshold -= 0.18 * gap_progress * (0.25 + 0.75 * activity_value)
     return float(np.clip(threshold, floor, 0.80))
@@ -138,7 +130,7 @@ def adaptive_generate_window(
     max_chord: int = 0,
     progress_callback=None,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """V3 free-running decoder with relative onset gating and silence recovery."""
+    """V3 free-run: relative onset peaks + active-audio silence recovery."""
     model.eval()
     batch, length, _ = audio.shape
     if len(audio_activity) != length or len(audio_peaks) != length:
@@ -200,12 +192,16 @@ def adaptive_generate_window(
                 activity=activity,
                 custom_threshold=float(onset_threshold),
             )
-            base = float(onset_threshold) if onset_threshold > 0 else _auto_base_threshold(float(stars[item].item()))
+            base = (
+                float(onset_threshold)
+                if onset_threshold > 0
+                else _auto_base_threshold(float(stars[item].item()))
+            )
             floor = _auto_floor_threshold(float(stars[item].item()))
             recovery = False
 
-            # If a musically active local peak appears after a full beat of
-            # silence, allow a lower-confidence but still non-trivial onset.
+            # After one beat without a key-down, an audio-local peak can break a
+            # self-reinforcing EMPTY loop even when the onset head is under-calibrated.
             if (
                 ticks_since[item] >= 24
                 and bool(audio_peaks[position])
@@ -216,9 +212,8 @@ def adaptive_generate_window(
                 threshold = max(floor * 0.80, onset_probability - 1e-5)
                 recovery = True
 
-            # Last-resort anti-collapse guard: after two beats of silence in an
-            # active region, accept a modest onset instead of feeding EMPTY back
-            # forever. Quiet audio is intentionally exempt.
+            # After two beats, permit a modest onset in active audio. Truly quiet
+            # sections remain exempt, so this is anti-collapse rather than a metronome.
             if (
                 ticks_since[item] >= 48
                 and activity >= 0.35
@@ -274,7 +269,9 @@ def adaptive_generate_window(
         )
 
         if progress_callback is not None and (
-            position == 0 or position + 1 == length or (position + 1) % report_every == 0
+            position == 0
+            or position + 1 == length
+            or (position + 1) % report_every == 0
         ):
             progress_callback(position + 1, length)
 
@@ -292,19 +289,25 @@ def adaptive_generate_window(
         "lane_fallbacks": fallback_count,
         "releases": releases,
         "base_onset_threshold": (
-            float(onset_threshold) if onset_threshold > 0 else _auto_base_threshold(float(stars[0].item()))
+            float(onset_threshold)
+            if onset_threshold > 0
+            else _auto_base_threshold(float(stars[0].item()))
         ),
         "floor_onset_threshold": _auto_floor_threshold(float(stars[0].item())),
+        "relative_quantile": 0.85,
+        "relative_margin": 0.025,
         "lane_threshold": float(lane_threshold),
         "ln_start_margin": float(ln_start_margin),
-        "max_chord_limit": _auto_max_chord(float(stars[0].item())) if max_chord <= 0 else int(max_chord),
+        "max_chord_limit": (
+            _auto_max_chord(float(stars[0].item())) if max_chord <= 0 else int(max_chord)
+        ),
     }
     return result, diagnostics
 
 
-def write_osu_v3(
+def _write_osu_v3(
     chart: np.ndarray,
-    output_path: str | Path,
+    output_path: Path,
     *,
     audio_filename: str,
     bpm: float,
@@ -312,86 +315,21 @@ def write_osu_v3(
     stars: float,
     title: str,
 ) -> Path:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    beat_length_ms = 60000.0 / float(bpm)
-    tick_ms = beat_length_ms / 24.0
-    objects: list[tuple[int, str]] = []
-    active_start: list[int | None] = [None] * 4
-
-    def time_for_tick(tick_index: int) -> int:
-        return max(0, int(round(float(offset_ms) + tick_index * tick_ms)))
-
-    for tick_index in range(len(chart)):
-        for lane in range(4):
-            state = int(chart[tick_index, lane])
-            x = LANE_X[lane]
-            if state == TAP:
-                time_ms = time_for_tick(tick_index)
-                objects.append((time_ms, f"{x},192,{time_ms},1,0,0:0:0:0:"))
-            elif state == LN_START:
-                active_start[lane] = tick_index
-            elif state == LN_END:
-                start_tick = active_start[lane]
-                if start_tick is not None:
-                    start_ms = time_for_tick(start_tick)
-                    end_ms = max(start_ms + 1, time_for_tick(tick_index))
-                    objects.append((start_ms, f"{x},192,{start_ms},128,0,{end_ms}:0:0:0:0:"))
-                    active_start[lane] = None
-
-    objects.sort(key=lambda item: (item[0], item[1]))
-    object_lines = "\n".join(line for _, line in objects)
-    text = f"""osu file format v14
-
-[General]
-AudioFilename: {audio_filename}
-AudioLeadIn: 0
-PreviewTime: -1
-Countdown: 0
-SampleSet: Normal
-StackLeniency: 0.7
-Mode: 3
-LetterboxInBreaks: 0
-WidescreenStoryboard: 1
-
-[Editor]
-DistanceSpacing: 1
-BeatDivisor: 4
-GridSize: 4
-TimelineZoom: 1
-
-[Metadata]
-Title:{title}
-TitleUnicode:{title}
-Artist:ORBIT-4K Input
-ArtistUnicode:ORBIT-4K Input
-Creator:ORBIT-4K V0
-Version:AI {stars:.2f} Star Preview V3
-Source:
-Tags:ORBIT-4K AI generated adaptive decoder v3
-BeatmapID:0
-BeatmapSetID:-1
-
-[Difficulty]
-HPDrainRate:5
-CircleSize:4
-OverallDifficulty:8
-ApproachRate:5
-SliderMultiplier:1.4
-SliderTickRate:1
-
-[Events]
-//Background and Video events
-//Break Periods
-
-[TimingPoints]
-{float(offset_ms):.6f},{beat_length_ms:.12f},4,2,0,100,1,0
-
-[HitObjects]
-{object_lines}
-"""
-    output_path.write_text(text, encoding="utf-8-sig")
-    return output_path
+    path = write_osu(
+        chart,
+        output_path,
+        audio_filename=audio_filename,
+        bpm=bpm,
+        offset_ms=offset_ms,
+        stars=stars,
+        title=title,
+    )
+    # Reuse the already-tested osu writer and only relabel the inference version.
+    text = path.read_text(encoding="utf-8-sig")
+    text = text.replace("Star Preview V2", "Star Preview V3")
+    text = text.replace("constrained decoder v2", "adaptive decoder v3")
+    path.write_text(text, encoding="utf-8-sig")
+    return path
 
 
 def generate_preview(
@@ -442,11 +380,15 @@ def generate_preview(
     tick_ms = beat_length_ms / int(config["grid"]["ticks_per_quarter"])
     requested_ticks = int(measures) * int(config["grid"]["ticks_per_measure"])
     duration_ms = float(cache["duration_ms"])
-    available_ticks = max(0, int(math.floor((duration_ms - float(offset_ms)) / tick_ms)) + 1)
+    available_ticks = max(
+        0,
+        int(math.floor((duration_ms - float(offset_ms)) / tick_ms)) + 1,
+    )
     length = min(requested_ticks, available_ticks)
     if length <= 0:
         raise ValueError(
-            f"audio has no usable ticks after offset {offset_ms} ms (duration={duration_ms:.1f} ms)"
+            f"audio has no usable ticks after offset {offset_ms} ms "
+            f"(duration={duration_ms:.1f} ms)"
         )
 
     tokens = beat_synchronous_audio_tokens(
@@ -503,9 +445,12 @@ def generate_preview(
     stats = chart_statistics(repaired)
     stats["repairs"] = len(repairs)
     stats["keydowns_per_measure"] = float(
-        stats["keydowns"] / max(1e-6, length / int(config["grid"]["ticks_per_measure"]))
+        stats["keydowns"]
+        / max(1e-6, length / int(config["grid"]["ticks_per_measure"]))
     )
-    stats["blank_tick_ratio"] = float(1.0 - stats["onset_ticks"] / max(1, length))
+    stats["blank_tick_ratio"] = float(
+        1.0 - stats["onset_ticks"] / max(1, length)
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     audio_target = output_dir / audio_path.name
@@ -513,8 +458,10 @@ def generate_preview(
         shutil.copy2(audio_path, audio_target)
 
     title = _safe_stem(audio_path.stem)
-    filename = _safe_stem(f"{audio_path.stem} [ORBIT-4K {stars:.2f}sr {measures}m V3]") + ".osu"
-    osu_path = write_osu_v3(
+    filename = _safe_stem(
+        f"{audio_path.stem} [ORBIT-4K {stars:.2f}sr {measures}m V3]"
+    ) + ".osu"
+    osu_path = _write_osu_v3(
         repaired,
         output_dir / filename,
         audio_filename=audio_target.name,
