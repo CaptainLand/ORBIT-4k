@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from orbit4k.inference_full import generate_full_song
 from orbit4k.inference_v3 import generate_preview
 
 
@@ -14,7 +15,9 @@ def _progress(payload: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate an ORBIT-4K V0 preview beatmap with adaptive V3 decoding")
+    parser = argparse.ArgumentParser(
+        description="Generate ORBIT-4K V0 preview or full-song beatmaps with adaptive V3 decoding"
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -24,6 +27,19 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.85)
     parser.add_argument("--measures", type=int, default=4)
     parser.add_argument("--seed", type=int, default=20260820)
+    parser.add_argument("--full-song", action="store_true")
+    parser.add_argument(
+        "--window-measures",
+        type=int,
+        default=4,
+        help="full-song audio window size in measures (3..16)",
+    )
+    parser.add_argument(
+        "--context-measures",
+        type=int,
+        default=1,
+        help="full-song left chart context and right audio lookahead in measures",
+    )
     parser.add_argument(
         "--onset-threshold",
         type=float,
@@ -46,7 +62,7 @@ def main() -> None:
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(encoding="utf-8", errors="backslashreplace")
 
-    result = generate_preview(
+    common = dict(
         checkpoint_path=args.checkpoint,
         audio_path=args.audio,
         output_dir=args.output_dir,
@@ -54,7 +70,6 @@ def main() -> None:
         offset_ms=args.offset_ms,
         stars=args.stars,
         temperature=args.temperature,
-        measures=args.measures,
         seed=args.seed,
         onset_threshold=args.onset_threshold,
         lane_threshold=args.lane_threshold,
@@ -62,6 +77,17 @@ def main() -> None:
         max_chord=args.max_chord,
         progress_callback=_progress,
     )
+    if args.full_song:
+        result = generate_full_song(
+            **common,
+            window_measures=args.window_measures,
+            context_measures=args.context_measures,
+        )
+    else:
+        result = generate_preview(
+            **common,
+            measures=args.measures,
+        )
     print(json.dumps(result, ensure_ascii=True), flush=True)
 
 
