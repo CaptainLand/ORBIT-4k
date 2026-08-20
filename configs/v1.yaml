@@ -30,10 +30,12 @@ window:
   train_samples_per_chart: 4
 
 dataset:
-  # Each DataLoader worker owns its own CPU audio cache. Keep this modest so a
-  # 1000+ song dataset grows training time/disk use rather than resident RAM.
-  audio_cache_size: 4
-  prefetch_factor: 2
+  # Each DataLoader worker owns its own CPU audio cache. Long marathon audio can
+  # still be hundreds of MiB even in float16, so keep only one full song per
+  # worker. Tokenization itself is windowed and only promotes the local frame
+  # slice to float32.
+  audio_cache_size: 1
+  prefetch_factor: 1
 
 model:
   audio_token_dim: 520
