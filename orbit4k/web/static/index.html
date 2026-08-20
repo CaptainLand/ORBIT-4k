@@ -3,24 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ORBIT-4K · V0 Lab</title>
+  <title>ORBIT-4K · Local Lab</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
   <div class="glow glow-a"></div><div class="glow glow-b"></div>
   <main>
-    <nav><div class="brand"><span class="orb"></span>ORBIT-4K</div><div class="badge">V0 · Local Training Lab</div></nav>
+    <nav><div class="brand"><span class="orb"></span>ORBIT-4K</div><div class="badge">V0 / V1 · Local Training Lab</div></nav>
     <section class="hero">
       <div>
         <p class="eyebrow">END-TO-END 4K CHART TRANSFORMER</p>
         <h1>把 Songs 文件夹交给 Lab，<br><span>从清洗一直跑到训练。</span></h1>
-        <p class="lede">本地 FastAPI 只监听 127.0.0.1。你可以指定原始谱面目录、清洗输出目录和训练输出目录；网页负责启动独立进程、显示日志与训练指标。</p>
+        <p class="lede">本地 FastAPI 只监听 127.0.0.1。V1 使用 32 个主 Cell × 3 个 1/96 Micro Slot，在不降低最终时间精度的前提下把 Transformer 主序列缩短到 V0 的三分之一。</p>
         <div class="actions"><a class="primary" href="#builder">准备数据</a><a class="ghost" href="#training">训练模型</a><a class="ghost" href="#playground">生成谱面</a></div>
       </div>
       <div class="visual-card">
         <div class="grid-demo" id="gridDemo"></div>
         <div class="signal"></div>
-        <div class="visual-label"><b>BEAT-SYNCHRONOUS AUDIO MEMORY</b><span>520-d token → 384-d hidden → 4 × 4 states</span></div>
+        <div class="visual-label"><b>HIERARCHICAL TIMING GRID</b><span>32 cells / measure × 3 micro slots = full 1/96 resolution</span></div>
       </div>
     </section>
 
@@ -32,17 +32,17 @@
     </section>
 
     <section class="panel architecture">
-      <header><div><p class="eyebrow">DATA CONTRACT</p><h2>MP3 不会变成文本，而是数值缓存</h2></div></header>
+      <header><div><p class="eyebrow">DATA CONTRACT</p><h2>同一份 1/96 缓存，可以直接训练 V0 或 V1</h2></div></header>
       <div class="flow">
         <div class="node accent"><small>RAW</small><b>MP3 / WAV</b><span>只在原始 Songs 中存在</span></div><i>→</i>
         <div class="node"><small>CACHE</small><b>Frame-level .npz</b><span>Log-Mel / mean / std / energy</span></div><i>→</i>
-        <div class="node"><small>ON THE FLY</small><b>520-d Audio Token</b><span>BPM + Offset 对齐 1/96 tick</span></div><i>↔</i>
-        <div class="node accent"><small>CHART</small><b>[T,4] .npz</b><span>EMPTY / TAP / START / END</span></div>
+        <div class="node"><small>V1 PACK</small><b>3 × 1/96 → 1 Cell</b><span>Transformer 只跑 32 cells / measure</span></div><i>↔</i>
+        <div class="node accent"><small>OUTPUT</small><b>3 Micro Slots</b><span>最终仍恢复完整 1/96 谱面</span></div>
       </div>
     </section>
 
     <section class="panel" id="builder">
-      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤 V0 不支持的多 BPM / 非 4/4 / 量化误差异常谱面。长音频采用分块频谱分析；单个坏音频会被拒绝并继续下一首，不再中断整批任务。</p></div></header>
+      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤当前不支持的多 BPM / 非 4/4 / 量化误差异常谱面。V1 可直接复用已经完成的 V0 数据集，不需要重新提取音频特征。</p></div></header>
       <div class="form-grid">
         <label><span>原始谱面 / Songs 路径</span><input id="sourcePath" placeholder="D:\osu!\Songs" /></label>
         <label><span>清洗输出路径</span><input id="outputPath" value="data/processed/v0" /></label>
@@ -66,11 +66,16 @@
     </section>
 
     <section class="panel" id="training">
-      <header><div><p class="eyebrow">TRAINING CONTROL</p><h2>指定 Dataset，启动 / 停止训练</h2><p>只有 Dataset Builder 正常完成、最终索引与 summary 均存在时才允许训练。partial 缓存会保留，但不会被误当成正式训练集。</p></div></header>
+      <header><div><p class="eyebrow">TRAINING CONTROL</p><h2>V0 / V1 可切换训练</h2><p>V1 默认读取同一个 <code>data/processed/v0</code>，把每 3 个 1/96 tick 在线打包成一个 1/32 Cell。可选从 V0 best.pt warm-start Transformer 主干。</p></div></header>
       <div class="form-grid">
+        <label><span>训练架构</span><select id="trainArchitecture"><option value="v1" selected>V1 · 32 Cell × 3 Micro</option><option value="v0">V0 · Flat 1/96</option></select></label>
         <label><span>清洗后的 Dataset</span><input id="trainDataPath" value="data/processed/v0" /></label>
-        <label><span>Checkpoint / Run 输出</span><input id="runDir" value="runs/v0" /></label>
-        <label><span>配置文件</span><input id="trainConfig" value="configs/v0.yaml" /></label>
+        <label><span>Checkpoint / Run 输出</span><input id="runDir" value="runs/v1" /></label>
+      </div>
+      <div class="form-grid">
+        <label><span>配置文件</span><input id="trainConfig" value="configs/v1.yaml" /></label>
+        <label><span>V0 Warm Start（V1 可选）</span><input id="trainWarmStart" value="runs/v0/best.pt" /></label>
+        <div class="setting-hint"><small>V1 会复用 Audio Encoder / Chart Decoder / Condition 等兼容权重；新的 32×3 输入输出层重新学习。</small></div>
       </div>
       <div id="datasetReadiness" class="summary-box warning"><b>正在检查 Dataset 状态…</b></div>
       <div class="toolbar">
@@ -80,10 +85,12 @@
       </div>
       <div class="training-grid">
         <div class="mini-stats vertical">
+          <div><span>Architecture</span><b id="trainArch">—</b></div>
           <div><span>Epoch</span><b id="epoch">—</b></div>
           <div><span>Train Loss</span><b id="trainLoss">—</b></div>
           <div><span>Validation Loss</span><b id="valLoss">—</b></div>
           <div><span>Learning Rate</span><b id="lr">—</b></div>
+          <div><span>Peak VRAM</span><b id="peakVram">—</b></div>
         </div>
         <div class="chart-box">
           <div class="chart-title"><span>LOSS CURVE</span><small>validation 优先，否则 train</small></div>
@@ -91,11 +98,11 @@
         </div>
       </div>
       <pre class="console" id="trainLog">等待开始训练…</pre>
-      <p class="note">训练完成后优先使用 <code>best.pt</code>。<code>runs/</code> 与 <code>*.pt</code> 已在 .gitignore 中，正常 git pull 不会覆盖本地模型。</p>
+      <p class="note">V1 默认 batch=4 / accumulation=4，并记录每轮 peak VRAM。若显存仍不足，优先把 <code>configs/v1.yaml</code> 的 batch_size 改回 2；歌曲总数本身不应该决定单步显存峰值。</p>
     </section>
 
     <section class="panel" id="playground">
-      <header><div><p class="eyebrow">MODEL PLAYGROUND · ADAPTIVE V3</p><h2>预览测试，或者直接生成整首 4K 谱面</h2><p>Preview 适合快速看采音；Full Song 会把整首音乐切成重叠窗口。默认 4 小节窗口中，左 1 小节使用已生成谱面作为上下文、右 1 小节只作为音频前瞻，中间 2 小节写入最终谱面，从而避免超长 Transformer 序列。</p></div></header>
+      <header><div><p class="eyebrow">MODEL PLAYGROUND · V0/V3.1</p><h2>预览测试，或者直接生成整首 4K 谱面</h2><p>当前网页 Playground 仍连接 V0/V3.1 整曲生成器。V1 训练完成后可先用 <code>python scripts/generate_v1.py</code> 做 32×3 预览测试；V1 Full Song 会在确认首个 checkpoint 质量后再接入。</p></div></header>
       <div class="form-grid">
         <label><span>Checkpoint</span><input id="genCheckpoint" value="runs/v0/best.pt" /></label>
         <label><span>音乐文件路径</span><input id="genAudio" placeholder="D:\Music\test.mp3" /></label>
@@ -117,7 +124,7 @@
       <div class="form-grid hidden" id="fullSongSettings">
         <label><span>滑窗长度 3～16 小节</span><input id="genWindowMeasures" type="number" min="3" max="16" step="1" value="4" /></label>
         <label><span>左右上下文 / 前瞻小节</span><input id="genContextMeasures" type="number" min="1" max="7" step="1" value="1" /></label>
-        <div class="setting-hint"><small>默认 4 / 1：每窗新写 2 小节。窗口越大上下文越长，但当前逐 tick Chart Decoder 会明显更慢。</small></div>
+        <div class="setting-hint"><small>默认 4 / 1：每窗新写 2 小节。窗口越大上下文越长，但当前 V0 Chart Decoder 仍逐 tick 自回归。</small></div>
       </div>
       <div class="toolbar">
         <button class="primary-btn" id="genStart">生成预览谱</button>
@@ -134,7 +141,7 @@
       <div id="genResult" class="summary-box hidden"></div>
       <div id="genFailure" class="failure-box hidden"></div>
       <pre class="console" id="genLog">等待加载模型…</pre>
-      <p class="note">整曲模式仍使用同一个 <code>best.pt</code>，不会修改模型。窗口交界处会 teacher-force 已生成的左侧谱面，并保留右侧音频 lookahead；LN 只在整首结束时统一校验，不会被窗口边界强制截断。</p>
+      <p class="note">V0 整曲模式使用滑窗 + 左侧谱面上下文 + 右侧音频 lookahead；V1 预览生成器已经独立提供。</p>
     </section>
 
     <section class="panel" id="dataset">
