@@ -60,6 +60,18 @@ class TrainRequest(JobRequest):
     run_dir: str
 
 
+class GenerateRequest(BaseModel):
+    checkpoint_path: str = "runs/v0/best.pt"
+    audio_path: str
+    output_dir: str = "runs/v0/generated"
+    bpm: float
+    offset_ms: float
+    stars: float
+    temperature: float = 0.85
+    measures: int = 4
+    seed: int = 20260820
+
+
 class ManagedJob:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -94,6 +106,8 @@ class ManagedJob:
             self.paths = dict(paths)
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
             self.process = subprocess.Popen(
                 command,
                 cwd=ROOT,
@@ -119,8 +133,6 @@ class ManagedJob:
                 if line.startswith("ORBIT4K_PROGRESS "):
                     try:
                         payload = json.loads(line[len("ORBIT4K_PROGRESS "):])
-                        # Preserve scan totals while later processing events update
-                        # current/percent/title fields.
                         self.progress.update(payload)
                     except json.JSONDecodeError:
                         pass
@@ -138,6 +150,8 @@ class ManagedJob:
                             "validation": record.get("validation", {}),
                             "learning_rate": record.get("learning_rate"),
                         }
+                    elif isinstance(record, dict) and record.get("stage") == "complete":
+                        self.progress.update(record)
         returncode = process.wait()
         with self.lock:
             self.returncode = returncode
@@ -189,10 +203,11 @@ class ManagedJob:
 
 prepare_job = ManagedJob("prepare")
 train_job = ManagedJob("train")
+generate_job = ManagedJob("generate")
 
 
 def ensure_idle() -> None:
-    if prepare_job.running() or train_job.running():
+    if prepare_job.running() or train_job.running() or generate_job.running():
         raise HTTPException(409, "another ORBIT-4K job is already running")
 
 
@@ -217,8 +232,6 @@ def dataset_status(path: Path) -> dict[str, Any]:
     index_exists = index_path.is_file()
     summary_exists = summary is not None
 
-    # New builders explicitly mark completion. Legacy datasets created before
-    # dataset_state.json existed remain usable if both final artifacts exist.
     if state is None:
         complete = index_exists and summary_exists
         status_name = "complete" if complete else "missing"
@@ -282,6 +295,7 @@ def jobs():
     return {
         "prepare": prepare_job.snapshot(),
         "train": train_job.snapshot(),
+        "generate": generate_job.snapshot(),
     }
 
 
@@ -356,6 +370,71 @@ def start_train(request: TrainRequest):
 @app.post("/api/train/stop")
 def stop_train():
     return {"ok": train_job.stop()}
+
+
+@app.post("/api/generate/start")
+def start_generate(request: GenerateRequest):
+    ensure_idle()
+    checkpoint = resolve_path(request.checkpoint_path)
+    audio = resolve_path(request.audio_path)
+    output_dir = resolve_path(request.output_dir)
+    if not checkpoint.is_file():
+        raise HTTPException(400, f"checkpoint not found: {checkpoint}")
+    if not audio.is_file():
+        raise HTTPException(400, f"audio file not found: {audio}")
+    if audio.suffix.lower() not in {".mp3", ".wav", ".ogg", ".flac", ".m4a"}:
+        raise HTTPException(400, "audio must be MP3/WAV/OGG/FLAC/M4A supported by torchaudio")
+    if not 20.0 <= request.bpm <= 500.0:
+        raise HTTPException(400, "BPM must be between 20 and 500")
+    if not 0.1 <= request.stars <= 15.0:
+        raise HTTPException(400, "target SR must be between 0.1 and 15")
+    if not 0.05 <= request.temperature <= 2.0:
+        raise HTTPException(400, "temperature must be between 0.05 and 2.0")
+    if not 1 <= request.measures <= 16:
+        raise HTTPException(400, "preview measures must be between 1 and 16")
+
+    command = [
+        sys.executable,
+        "-u",
+        str(ROOT / "scripts" / "generate_v0.py"),
+        "--checkpoint",
+        str(checkpoint),
+        "--audio",
+        str(audio),
+        "--output-dir",
+        str(output_dir),
+        "--bpm",
+        str(request.bpm),
+        "--offset-ms",
+        str(request.offset_ms),
+        "--stars",
+        str(request.stars),
+        "--temperature",
+        str(request.temperature),
+        "--measures",
+        str(request.measures),
+        "--seed",
+        str(request.seed),
+    ]
+    generate_job.start(
+        command,
+        paths={
+            "checkpoint": str(checkpoint),
+            "audio": str(audio),
+            "output_dir": str(output_dir),
+        },
+    )
+    return {
+        "ok": True,
+        "checkpoint": str(checkpoint),
+        "audio": str(audio),
+        "output_dir": str(output_dir),
+    }
+
+
+@app.post("/api/generate/stop")
+def stop_generate():
+    return {"ok": generate_job.stop()}
 
 
 @app.get("/api/dataset-summary")
