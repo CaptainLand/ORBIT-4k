@@ -61,6 +61,7 @@ class TrainRequest(JobRequest):
 
 
 class GenerateRequest(BaseModel):
+    mode: str = "preview"
     checkpoint_path: str = "runs/v0/best.pt"
     audio_path: str
     output_dir: str = "runs/v0/generated"
@@ -69,6 +70,8 @@ class GenerateRequest(BaseModel):
     stars: float
     temperature: float = 0.85
     measures: int = 4
+    window_measures: int = 4
+    context_measures: int = 1
     seed: int = 20260820
 
 
@@ -378,6 +381,9 @@ def start_generate(request: GenerateRequest):
     checkpoint = resolve_path(request.checkpoint_path)
     audio = resolve_path(request.audio_path)
     output_dir = resolve_path(request.output_dir)
+    mode = request.mode.strip().lower()
+    if mode not in {"preview", "full_song"}:
+        raise HTTPException(400, "generation mode must be preview or full_song")
     if not checkpoint.is_file():
         raise HTTPException(400, f"checkpoint not found: {checkpoint}")
     if not audio.is_file():
@@ -390,8 +396,13 @@ def start_generate(request: GenerateRequest):
         raise HTTPException(400, "target SR must be between 0.1 and 15")
     if not 0.05 <= request.temperature <= 2.0:
         raise HTTPException(400, "temperature must be between 0.05 and 2.0")
-    if not 1 <= request.measures <= 16:
+    if mode == "preview" and not 1 <= request.measures <= 16:
         raise HTTPException(400, "preview measures must be between 1 and 16")
+    if mode == "full_song":
+        if not 3 <= request.window_measures <= 16:
+            raise HTTPException(400, "full-song window measures must be between 3 and 16")
+        if not 1 <= request.context_measures or 2 * request.context_measures >= request.window_measures:
+            raise HTTPException(400, "context must be at least 1 measure and less than half the window")
 
     command = [
         sys.executable,
@@ -411,14 +422,26 @@ def start_generate(request: GenerateRequest):
         str(request.stars),
         "--temperature",
         str(request.temperature),
-        "--measures",
-        str(request.measures),
         "--seed",
         str(request.seed),
     ]
+    if mode == "full_song":
+        command.extend(
+            [
+                "--full-song",
+                "--window-measures",
+                str(request.window_measures),
+                "--context-measures",
+                str(request.context_measures),
+            ]
+        )
+    else:
+        command.extend(["--measures", str(request.measures)])
+
     generate_job.start(
         command,
         paths={
+            "mode": mode,
             "checkpoint": str(checkpoint),
             "audio": str(audio),
             "output_dir": str(output_dir),
@@ -426,6 +449,7 @@ def start_generate(request: GenerateRequest):
     )
     return {
         "ok": True,
+        "mode": mode,
         "checkpoint": str(checkpoint),
         "audio": str(audio),
         "output_dir": str(output_dir),
