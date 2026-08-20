@@ -28,7 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 STATIC = Path(__file__).resolve().parent / "static"
 CONFIG_PATH = ROOT / "configs" / "v0.yaml"
 
-app = FastAPI(title="ORBIT-4K V0 Lab")
+app = FastAPI(title="ORBIT-4K Lab")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
@@ -58,6 +58,8 @@ class PrepareRequest(JobRequest):
 class TrainRequest(JobRequest):
     data_path: str
     run_dir: str
+    architecture: str = "v0"
+    warm_start_v0: str | None = None
 
 
 class GenerateRequest(BaseModel):
@@ -152,6 +154,8 @@ class ManagedJob:
                             "train": record.get("train", {}),
                             "validation": record.get("validation", {}),
                             "learning_rate": record.get("learning_rate"),
+                            "gpu_memory": record.get("gpu_memory", {}),
+                            "architecture": record.get("architecture"),
                         }
                     elif isinstance(record, dict) and record.get("stage") == "complete":
                         self.progress.update(record)
@@ -277,14 +281,15 @@ def status():
     )
     default_data = ROOT / "data" / "processed" / "v0"
     return {
-        "version": "V0",
+        "version": "V0 + V1",
         "parameters": parameter_count(model),
-        "grid": "1/96 whole note (24 ticks / quarter)",
+        "grid": "V0 1/96 flat · V1 32 cells x 3 micro slots",
         "model": "Beat-synchronous Audio Encoder + Causal Chart Decoder",
         "audio_token_dim": AUDIO_TOKEN_DIM,
         "audio_feature_version": AUDIO_FEATURE_VERSION,
         "dataset": dataset_summary(default_data),
         "checkpoint_ready": (ROOT / "runs" / "v0" / "best.pt").exists(),
+        "v1_checkpoint_ready": (ROOT / "runs" / "v1" / "best.pt").exists(),
         "cuda": {
             "available": torch.cuda.is_available(),
             "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
@@ -343,6 +348,10 @@ def start_train(request: TrainRequest):
     data = resolve_path(request.data_path)
     run_dir = resolve_path(request.run_dir)
     cfg = resolve_path(request.config_path)
+    architecture = request.architecture.strip().lower()
+    if architecture not in {"v0", "v1"}:
+        raise HTTPException(400, "training architecture must be v0 or v1")
+
     readiness = dataset_status(data)
     if not readiness["ready"]:
         detail = (
@@ -352,10 +361,12 @@ def start_train(request: TrainRequest):
         raise HTTPException(400, detail)
     if not cfg.is_file():
         raise HTTPException(400, f"config file does not exist: {cfg}")
+
+    script = ROOT / "scripts" / ("train_v1.py" if architecture == "v1" else "train_v0.py")
     command = [
         sys.executable,
         "-u",
-        str(ROOT / "scripts" / "train_v0.py"),
+        str(script),
         "--data",
         str(data),
         "--run-dir",
@@ -363,11 +374,30 @@ def start_train(request: TrainRequest):
         "--config",
         str(cfg),
     ]
+    warm_start = None
+    if architecture == "v1" and request.warm_start_v0 and request.warm_start_v0.strip():
+        warm_start = resolve_path(request.warm_start_v0)
+        if not warm_start.is_file():
+            raise HTTPException(400, f"V0 warm-start checkpoint not found: {warm_start}")
+        command.extend(["--warm-start-v0", str(warm_start)])
+
     train_job.start(
         command,
-        paths={"data": str(data), "run_dir": str(run_dir), "config": str(cfg)},
+        paths={
+            "architecture": architecture,
+            "data": str(data),
+            "run_dir": str(run_dir),
+            "config": str(cfg),
+            "warm_start_v0": "" if warm_start is None else str(warm_start),
+        },
     )
-    return {"ok": True, "data": str(data), "run_dir": str(run_dir)}
+    return {
+        "ok": True,
+        "architecture": architecture,
+        "data": str(data),
+        "run_dir": str(run_dir),
+        "warm_start_v0": None if warm_start is None else str(warm_start),
+    }
 
 
 @app.post("/api/train/stop")
