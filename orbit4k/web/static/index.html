@@ -13,9 +13,9 @@
     <section class="hero">
       <div>
         <p class="eyebrow">END-TO-END 4K CHART TRANSFORMER</p>
-        <h1>把 Songs 文件夹交给 Lab，<br><span>从清洗一直跑到试玩。</span></h1>
-        <p class="lede">本地 FastAPI 只监听 127.0.0.1。可以准备 Dataset、训练模型，再直接加载 best.pt 给新音乐生成 4K 预览谱。</p>
-        <div class="actions"><a class="primary" href="#builder">准备数据</a><a class="ghost" href="#training">训练模型</a><a class="ghost" href="#playground">模型试玩</a></div>
+        <h1>把 Songs 文件夹交给 Lab，<br><span>从清洗一直跑到训练。</span></h1>
+        <p class="lede">本地 FastAPI 只监听 127.0.0.1。你可以指定原始谱面目录、清洗输出目录和训练输出目录；网页负责启动独立进程、显示日志与训练指标。</p>
+        <div class="actions"><a class="primary" href="#builder">准备数据</a><a class="ghost" href="#training">训练模型</a><a class="ghost" href="#playground">生成谱面</a></div>
       </div>
       <div class="visual-card">
         <div class="grid-demo" id="gridDemo"></div>
@@ -42,7 +42,7 @@
     </section>
 
     <section class="panel" id="builder">
-      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤 V0 不支持的多 BPM / 非 4/4 / 量化误差异常谱面。长音频采用分块频谱分析；单个坏音频会被拒绝并继续下一首。</p></div></header>
+      <header><div><p class="eyebrow">DATASET BUILDER</p><h2>指定 Songs 与清洗输出目录</h2><p>只保留 mania 4K，并过滤 V0 不支持的多 BPM / 非 4/4 / 量化误差异常谱面。长音频采用分块频谱分析；单个坏音频会被拒绝并继续下一首，不再中断整批任务。</p></div></header>
       <div class="form-grid">
         <label><span>原始谱面 / Songs 路径</span><input id="sourcePath" placeholder="D:\osu!\Songs" /></label>
         <label><span>清洗输出路径</span><input id="outputPath" value="data/processed/v0" /></label>
@@ -95,7 +95,7 @@
     </section>
 
     <section class="panel" id="playground">
-      <header><div><p class="eyebrow">MODEL PLAYGROUND</p><h2>加载 best.pt，给一首新音乐生成 4K 预览谱</h2><p>V0 仍需手动提供 BPM 与 Offset。默认只生成 4 小节用于快速检验采音、Pattern 与 LN；可调到 1～16 小节。当前 Chart Decoder 仍逐 tick 自回归，所以小节越多越慢。</p></div></header>
+      <header><div><p class="eyebrow">MODEL PLAYGROUND · ADAPTIVE V3</p><h2>预览测试，或者直接生成整首 4K 谱面</h2><p>Preview 适合快速看采音；Full Song 会把整首音乐切成重叠窗口。默认 4 小节窗口中，左 1 小节使用已生成谱面作为上下文、右 1 小节只作为音频前瞻，中间 2 小节写入最终谱面，从而避免超长 Transformer 序列。</p></div></header>
       <div class="form-grid">
         <label><span>Checkpoint</span><input id="genCheckpoint" value="runs/v0/best.pt" /></label>
         <label><span>音乐文件路径</span><input id="genAudio" placeholder="D:\Music\test.mp3" /></label>
@@ -107,9 +107,17 @@
         <label><span>目标 Star Rating</span><input id="genStars" type="number" step="0.1" value="5.0" /></label>
       </div>
       <div class="form-grid">
+        <label><span>生成模式</span><select id="genMode"><option value="preview">Preview · 小节预览</option><option value="full_song">Full Song · 整曲生成</option></select></label>
         <label><span>Temperature</span><input id="genTemperature" type="number" step="0.05" value="0.85" /></label>
-        <label><span>预览小节数 1～16</span><input id="genMeasures" type="number" min="1" max="16" step="1" value="4" /></label>
         <label><span>随机种子</span><input id="genSeed" type="number" step="1" value="20260820" /></label>
+      </div>
+      <div class="form-grid" id="previewSettings">
+        <label><span>预览小节数 1～16</span><input id="genMeasures" type="number" min="1" max="16" step="1" value="4" /></label>
+      </div>
+      <div class="form-grid hidden" id="fullSongSettings">
+        <label><span>滑窗长度 3～16 小节</span><input id="genWindowMeasures" type="number" min="3" max="16" step="1" value="4" /></label>
+        <label><span>左右上下文 / 前瞻小节</span><input id="genContextMeasures" type="number" min="1" max="7" step="1" value="1" /></label>
+        <div class="setting-hint"><small>默认 4 / 1：每窗新写 2 小节。窗口越大上下文越长，但当前逐 tick Chart Decoder 会明显更慢。</small></div>
       </div>
       <div class="toolbar">
         <button class="primary-btn" id="genStart">生成预览谱</button>
@@ -119,14 +127,14 @@
       <div class="progress-shell"><div class="progress-bar" id="genProgress"></div></div>
       <div class="mini-stats">
         <div><span>Stage</span><b id="genStage">—</b></div>
-        <div><span>Ticks</span><b id="genTicks">—</b></div>
+        <div><span>Progress</span><b id="genTicks">—</b></div>
         <div><span>Keydowns</span><b id="genKeydowns">—</b></div>
         <div><span>Repairs</span><b id="genRepairs">—</b></div>
       </div>
       <div id="genResult" class="summary-box hidden"></div>
       <div id="genFailure" class="failure-box hidden"></div>
       <pre class="console" id="genLog">等待加载模型…</pre>
-      <p class="note">生成目录会包含新的 <code>.osu</code> 和一份音频副本，可作为单独 beatmap 文件夹导入 osu!。这是 V0 preview，不代表最终整首歌推理性能。</p>
+      <p class="note">整曲模式仍使用同一个 <code>best.pt</code>，不会修改模型。窗口交界处会 teacher-force 已生成的左侧谱面，并保留右侧音频 lookahead；LN 只在整首结束时统一校验，不会被窗口边界强制截断。</p>
     </section>
 
     <section class="panel" id="dataset">
