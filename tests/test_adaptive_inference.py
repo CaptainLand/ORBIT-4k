@@ -22,6 +22,17 @@ def test_relative_history_can_lower_v2_style_absolute_gate():
     assert threshold >= _auto_floor_threshold(6.0)
 
 
+def test_flat_probability_background_is_not_itself_a_peak():
+    history = [0.20] * 24
+    threshold = adaptive_onset_threshold(
+        history,
+        stars=6.0,
+        ticks_since_keydown=4,
+        activity=0.80,
+    )
+    assert threshold > 0.20
+
+
 def test_active_silence_relaxes_threshold_progressively():
     history = [0.18, 0.20, 0.22, 0.24, 0.21, 0.23, 0.25, 0.20]
     early = adaptive_onset_threshold(
