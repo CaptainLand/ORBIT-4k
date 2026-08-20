@@ -4,18 +4,24 @@ const fmt = (n, d=4) => Number.isFinite(Number(n)) ? Number(n).toFixed(d) : '—
 const savedKeys = [
   'sourcePath','outputPath','prepareConfig','trainDataPath','runDir','trainConfig',
   'genCheckpoint','genAudio','genOutput','genBpm','genOffset','genStars',
-  'genTemperature','genMeasures','genSeed'
+  'genMode','genTemperature','genMeasures','genWindowMeasures','genContextMeasures','genSeed'
 ];
 let datasetReady = false;
 let trainRunning = false;
 let generateRunning = false;
 
-function savePaths(){ savedKeys.forEach(k => localStorage.setItem(`orbit4k:${k}`, $(`#${k}`).value)); }
-function restorePaths(){ savedKeys.forEach(k => { const v=localStorage.getItem(`orbit4k:${k}`); if(v) $(`#${k}`).value=v; }); }
+function savePaths(){ savedKeys.forEach(k => { const el=$(`#${k}`); if(el) localStorage.setItem(`orbit4k:${k}`, el.value); }); }
+function restorePaths(){ savedKeys.forEach(k => { const el=$(`#${k}`), v=localStorage.getItem(`orbit4k:${k}`); if(el&&v!=null) el.value=v; }); }
 function setText(id, value){ $(id).textContent = value ?? '—'; }
 function logsText(lines){ return (lines && lines.length ? lines.slice(-80).join('\n') : '—'); }
 function updateTrainButton(){ $('#trainStart').disabled = trainRunning || generateRunning || !datasetReady; }
 function updateGenerateButton(){ $('#genStart').disabled = generateRunning || trainRunning; }
+function updateGenerationModeUI(){
+  const full=$('#genMode').value==='full_song';
+  $('#previewSettings').classList.toggle('hidden', full);
+  $('#fullSongSettings').classList.toggle('hidden', !full);
+  $('#genStart').textContent=full?'生成整首谱面':'生成预览谱';
+}
 
 async function api(url, options={}){
   const r = await fetch(url, options);
@@ -139,28 +145,39 @@ function renderTrain(job){
 function renderGenerate(job){
   generateRunning=Boolean(job.running);
   const p=job.progress || {}, stats=p.stats || {};
+  const mode=p.mode || job.paths?.mode || $('#genMode').value || 'preview';
+  const full=mode==='full_song';
   setText('#genState', job.state);
   setText('#genStage', p.stage || '—');
   const percent=Number(p.percent ?? (p.stage==='complete'?100:0));
   $('#genProgress').style.width=`${Math.max(0,Math.min(100,percent))}%`;
-  setText('#genTicks', p.total ? `${p.current ?? 0} / ${p.total}` : (p.generated_ticks ?? '—'));
+  if(full && p.total){
+    const windowInfo=p.total_windows ? ` · window ${p.window ?? 0}/${p.total_windows}` : '';
+    setText('#genTicks', `${p.current ?? 0} / ${p.total} (${fmt(percent,1)}%)${windowInfo}`);
+  }else{
+    setText('#genTicks', p.total ? `${p.current ?? 0} / ${p.total}` : (p.generated_ticks ?? '—'));
+  }
   setText('#genKeydowns', stats.keydowns ?? '—');
   setText('#genRepairs', stats.repairs ?? '—');
   $('#genLog').textContent=logsText(job.logs);
 
   const result=$('#genResult'), failure=$('#genFailure');
   if(job.state==='completed' && p.output){
+    const extra=full
+      ? `<span>Length <strong>${fmt(stats.duration_seconds,1)} s / ${fmt(stats.generated_measures,1)} m</strong></span><span>Windows <strong>${p.windows ?? '—'}</strong></span>`
+      : '';
     result.className='summary-box ready';
-    result.innerHTML=`<b>✓ Preview Generated</b><p><strong>.osu:</strong> ${p.output}</p><div class="summary-grid"><span>Checkpoint epoch <strong>${p.checkpoint_epoch ?? '—'}</strong></span><span>SR <strong>${p.stars ?? '—'}</strong></span><span>Keydowns <strong>${stats.keydowns ?? '—'}</strong></span><span>Tap / LN <strong>${stats.taps ?? 0} / ${stats.ln ?? 0}</strong></span><span>Chord ticks <strong>${stats.chord_ticks ?? 0}</strong></span><span>Repairs <strong>${stats.repairs ?? 0}</strong></span></div>`;
+    result.innerHTML=`<b>✓ ${full?'Full Song':'Preview'} Generated</b><p><strong>.osu:</strong> ${p.output}</p><div class="summary-grid"><span>Checkpoint epoch <strong>${p.checkpoint_epoch ?? '—'}</strong></span><span>SR <strong>${p.stars ?? '—'}</strong></span><span>Keydowns <strong>${stats.keydowns ?? '—'}</strong></span><span>Tap / LN <strong>${stats.taps ?? 0} / ${stats.ln ?? 0}</strong></span><span>Chord ticks <strong>${stats.chord_ticks ?? 0}</strong></span><span>Repairs <strong>${stats.repairs ?? 0}</strong></span>${extra}</div>`;
     result.classList.remove('hidden');
   }else if(job.running){
     result.classList.add('hidden');
   }
   if(job.state==='failed'){
     failure.classList.remove('hidden');
-    failure.innerHTML=`<b>Preview generation failed</b><p>${job.failure_reason || p.last_error || '查看生成日志。'}</p>`;
+    failure.innerHTML=`<b>${full?'Full-song':'Preview'} generation failed</b><p>${job.failure_reason || p.last_error || '查看生成日志。'}</p>`;
   }else failure.classList.add('hidden');
 
+  if(job.paths?.mode){ $('#genMode').value=job.paths.mode; updateGenerationModeUI(); }
   if(job.paths?.checkpoint) $('#genCheckpoint').value=job.paths.checkpoint;
   if(job.paths?.audio) $('#genAudio').value=job.paths.audio;
   if(job.paths?.output_dir) $('#genOutput').value=job.paths.output_dir;
@@ -204,11 +221,13 @@ $('#trainStop').addEventListener('click', async()=>{try{await postJson('/api/tra
 $('#trainDataPath').addEventListener('change', refreshDatasetReadiness);
 $('#trainDataPath').addEventListener('blur', refreshDatasetReadiness);
 
+$('#genMode').addEventListener('change',()=>{ updateGenerationModeUI(); savePaths(); });
 $('#genStart').addEventListener('click', async()=>{
   savePaths();
   $('#genResult').classList.add('hidden');
   try{
     await postJson('/api/generate/start',{
+      mode:$('#genMode').value,
       checkpoint_path:$('#genCheckpoint').value,
       audio_path:$('#genAudio').value,
       output_dir:$('#genOutput').value,
@@ -217,6 +236,8 @@ $('#genStart').addEventListener('click', async()=>{
       stars:Number($('#genStars').value),
       temperature:Number($('#genTemperature').value),
       measures:Number($('#genMeasures').value),
+      window_measures:Number($('#genWindowMeasures').value),
+      context_measures:Number($('#genContextMeasures').value),
       seed:Number($('#genSeed').value),
     });
     await pollJobs();
@@ -240,4 +261,4 @@ input.addEventListener('change',()=>input.files[0]&&inspect(input.files[0]));
 ['dragleave','drop'].forEach(e=>drop.addEventListener(e,x=>{x.preventDefault();drop.classList.remove('drag')}));
 drop.addEventListener('drop',e=>e.dataTransfer.files[0]&&inspect(e.dataTransfer.files[0]));
 
-restorePaths(); buildGrid(); loadStatus(); pollJobs(); setInterval(pollJobs,1000);
+restorePaths(); updateGenerationModeUI(); buildGrid(); loadStatus(); pollJobs(); setInterval(pollJobs,1000);
