@@ -1,0 +1,83 @@
+seed: 20260820
+
+architecture: v1_32x3
+
+grid:
+  ticks_per_quarter: 24
+  ticks_per_measure: 96
+  micro_ticks_per_cell: 3
+  cells_per_quarter: 8
+  cells_per_measure: 32
+  supported_meter: 4
+  max_quantization_error_ms: 8.0
+  constant_bpm_only: true
+
+audio:
+  sample_rate: 44100
+  n_fft: 1024
+  win_length: 1024
+  hop_length: 220
+  n_mels: 128
+  f_min: 30.0
+  f_max: 18000.0
+  chunk_seconds: 30.0
+
+# Same musical context as V0, but the Transformer sees 16*32=512 cells instead
+# of 16*96=1536 independent timesteps.
+window:
+  measures: 16
+  stride_measures: 8
+  train_samples_per_chart: 4
+
+dataset:
+  # Each DataLoader worker owns its own CPU audio cache. Keep this modest so a
+  # 1000+ song dataset grows training time/disk use rather than resident RAM.
+  audio_cache_size: 4
+  prefetch_factor: 2
+
+model:
+  audio_token_dim: 520
+  audio_micro_dim: 128
+  d_model: 384
+  n_heads: 6
+  audio_layers: 6
+  chart_layers: 8
+  micro_layers: 1
+  micro_dim_feedforward: 768
+  dim_feedforward: 1536
+  dropout: 0.10
+  # V0 used 96 ticks; dividing by 3 preserves the same musical locality.
+  local_audio_scale_cells: 32.0
+  max_cross_attention_bias: 4.0
+  state_vocab: 5
+  output_states: 4
+  micro_slots: 3
+
+training:
+  # V1 is substantially lighter than V0. Batch 4 + accumulation 4 preserves an
+  # effective batch of 16 while using fewer optimizer micro-steps than V0 2x8.
+  # If a smaller GPU still OOMs, lower batch_size to 2 before changing the model.
+  batch_size: 4
+  gradient_accumulation: 4
+  epochs: 30
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_steps: 1000
+  num_workers: 2
+  amp: true
+  clip_grad_norm: 1.0
+
+  # Less aggressive rare-state weighting than V0; V1's hierarchical onset heads
+  # already fight EMPTY dominance, so LN no longer needs a 1.4x push.
+  class_weights: [0.20, 1.0, 1.2, 1.2]
+  cell_onset_weight: 0.35
+  micro_onset_weight: 0.25
+  density_weight: 0.10
+  cell_onset_pos_weight: 2.0
+  micro_onset_pos_weight: 2.5
+  validation_every: 1
+
+splits:
+  train: 0.90
+  validation: 0.05
+  test: 0.05
